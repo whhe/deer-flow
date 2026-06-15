@@ -11,6 +11,10 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from deerflow.agents.middlewares.tool_result_meta import (
+    normalize_tool_result,
+    stamp_exception_meta,
+)
 from deerflow.config.app_config import AppConfig
 from deerflow.subagents.status_contract import (
     extract_subagent_status,
@@ -79,7 +83,8 @@ class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         # carries the same ``ExcClass: detail`` shape the wrapper string
         # uses so debugging artifacts stay aligned.
         structured_error = f"{exc.__class__.__name__}: {detail}"
-        return _stamp_task_subagent_status(message, tool_name=tool_name, error=structured_error)
+        message = _stamp_task_subagent_status(message, tool_name=tool_name, error=structured_error)
+        return stamp_exception_meta(message, structured_error)
 
     @staticmethod
     def _maybe_stamp(result: ToolMessage | Command, request: ToolCallRequest) -> ToolMessage | Command:
@@ -107,7 +112,7 @@ class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         except Exception as exc:
             logger.exception("Tool execution failed (sync): name=%s id=%s", request.tool_call.get("name"), request.tool_call.get("id"))
             return self._build_error_message(request, exc)
-        return self._maybe_stamp(result, request)
+        return normalize_tool_result(self._maybe_stamp(result, request))
 
     @override
     async def awrap_tool_call(
@@ -123,7 +128,7 @@ class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         except Exception as exc:
             logger.exception("Tool execution failed (async): name=%s id=%s", request.tool_call.get("name"), request.tool_call.get("id"))
             return self._build_error_message(request, exc)
-        return self._maybe_stamp(result, request)
+        return normalize_tool_result(self._maybe_stamp(result, request))
 
 
 def _build_runtime_middlewares(
@@ -183,7 +188,19 @@ def _build_runtime_middlewares(
     from deerflow.agents.middlewares.sandbox_audit_middleware import SandboxAuditMiddleware
 
     middlewares.append(SandboxAuditMiddleware())
+
+    # ToolProgressMiddleware must be outer (lower index) so its wrap_tool_call handler
+    # chain includes ToolErrorHandlingMiddleware (inner), which stamps deerflow_tool_meta
+    # on every result before ToolProgressMiddleware reads it in _update_state_from_result.
+    # Framework rule: first in list = outermost (types.py: "compose with first in list as outermost layer").
+    tool_progress_config = app_config.tool_progress
+    if tool_progress_config.enabled:
+        from deerflow.agents.middlewares.tool_progress_middleware import ToolProgressMiddleware
+
+        middlewares.append(ToolProgressMiddleware.from_config(tool_progress_config))
+
     middlewares.append(ToolErrorHandlingMiddleware())
+
     return middlewares
 
 
