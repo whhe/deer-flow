@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -161,6 +162,18 @@ def test_is_near_duplicate_above_threshold():
     ws1 = frozenset("quick brown fox jumps over lazy dog".split())
     ws2 = frozenset("quick brown fox jumps over lazy dog".split())
     assert is_near_duplicate(ws2, [ws1], threshold=0.8, min_words=5)
+
+
+def test_is_near_duplicate_near_threshold():
+    # ws1 has 8 words; ws2 shares 7 of them and adds 1 new word.
+    # intersection=7, union=9  →  Jaccard = 7/9 ≈ 0.778 < 0.8 → NOT duplicate.
+    # ws3 shares all 8 original words and adds 1 new word.
+    # intersection=8, union=9  →  Jaccard = 8/9 ≈ 0.889 >= 0.8 → IS duplicate.
+    base = frozenset("alpha bravo charlie delta echo foxtrot golf hotel".split())
+    nearly_below = frozenset("alpha bravo charlie delta echo foxtrot golf india".split())  # 7/9 ≈ 0.778
+    nearly_above = frozenset("alpha bravo charlie delta echo foxtrot golf hotel india".split())  # 8/9 ≈ 0.889
+    assert not is_near_duplicate(nearly_below, [base], threshold=0.8, min_words=5)
+    assert is_near_duplicate(nearly_above, [base], threshold=0.8, min_words=5)
 
 
 def test_is_near_duplicate_below_threshold():
@@ -450,6 +463,39 @@ def test_jaccard_different_content_not_a_problem():
 
 
 # ---------------------------------------------------------------------------
+# Scenario 9b: production default min_words=10 skips Jaccard for short content
+
+
+def test_jaccard_skipped_when_content_below_production_min_words():
+    """Production default min_words=10 must skip Jaccard for content with 6-9 unique words.
+
+    _make_mw() uses min_words=5 to make most tests easier to set up.  This test
+    uses the production default (min_words=10) to verify that short but repeated
+    content does NOT count as a near-duplicate stagnation problem.
+    """
+    mw = ToolProgressMiddleware(
+        stagnation_threshold=3,
+        warn_escalation_count=2,
+        jaccard_threshold=0.8,
+        min_words=10,  # production default
+    )
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+
+    # 7 unique words — above min_words=5 but below production min_words=10.
+    # With min_words=10 the Jaccard check is skipped → never a problem → phase stays active.
+    words = "apple banana cherry delta echo foxtrot golf"
+    msg = _make_tool_message(words)
+
+    for _ in range(5):
+        mw.wrap_tool_call(req, lambda r: msg)
+
+    state = mw._phase_states["t1"]["web_search"]
+    assert state.phase == "active", "7-word repeated content must not trigger stagnation with production min_words=10"
+    assert state.consecutive_problems == 0
+
+
+# ---------------------------------------------------------------------------
 # Scenario 10: exempt_tools are not tracked
 
 
@@ -496,8 +542,82 @@ def test_before_agent_clears_stale_pending():
     assert leftovers == []
 
 
+@pytest.mark.anyio
+async def test_abefore_agent_clears_stale_pending():
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5)
+    rt_run1 = _make_runtime(thread_id="t1", run_id="old-run")
+    rt_run2 = _make_runtime(thread_id="t1", run_id="new-run")
+    req = _make_tool_request(runtime=rt_run1)
+    error_msg = _make_error_message()
+
+    mw.wrap_tool_call(req, lambda r: error_msg)
+    mw.wrap_tool_call(req, lambda r: error_msg)
+    mw._drain_pending(rt_run1)
+    mw._queue_assessment(rt_run1, "old hint")
+
+    state_mock = MagicMock()
+    await mw.abefore_agent(state_mock, rt_run2)
+
+    leftovers = mw._pending.get(("t1", "old-run"), [])
+    assert leftovers == []
+
+
+def test_before_agent_preserves_current_run_hints():
+    # _clear_stale_pending deletes keys where thread_id matches but run_id differs.
+    # Hints for the *current* run must not be evicted.
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5)
+    rt = _make_runtime(thread_id="t1", run_id="current-run")
+    mw._queue_assessment(rt, "current hint")
+
+    state_mock = MagicMock()
+    mw.before_agent(state_mock, rt)
+
+    preserved = mw._pending.get(("t1", "current-run"), [])
+    assert preserved == ["current hint"]
+
+
 # ---------------------------------------------------------------------------
 # Scenario 12: LRU eviction when max_tracked_threads exceeded
+
+
+def test_get_block_reason_does_not_create_phantom_entries():
+    # _get_block_reason is called on every wrap_tool_call before the handler.
+    # It must not insert an empty entry for new threads (which could prematurely
+    # evict another thread's WARNED state via LRU).
+    mw = _make_mw(max_tracked_threads=2, stagnation_threshold=2)
+    rt_a = _make_runtime(thread_id="thread-a")
+    rt_b = _make_runtime(thread_id="thread-b")
+    rt_c = _make_runtime(thread_id="thread-c")
+
+    req_a = _make_tool_request(runtime=rt_a)
+    error_msg = _make_error_message()
+
+    # Drive thread-a to WARNED state (needs 2 error calls with threshold=2).
+    mw.wrap_tool_call(req_a, lambda r: error_msg)
+    mw.wrap_tool_call(req_a, lambda r: error_msg)
+    assert mw._phase_states["thread-a"]["web_search"].phase == "warned"
+
+    # Drive thread-b so it has a real entry too.
+    req_b = _make_tool_request(runtime=rt_b)
+    good_msg = _make_tool_message("A" * 300)
+    mw.wrap_tool_call(req_b, lambda r: good_msg)
+    assert "thread-b" in mw._phase_states
+
+    # Now thread-c makes its very first call. max_tracked_threads=2, so adding
+    # thread-c must evict one of {thread-a, thread-b} — but the eviction must
+    # only happen in _update_state_from_result (the write path), not in
+    # _get_block_reason (the read path that runs first).
+    # After wrap_tool_call completes, the two survivors should be thread-b and
+    # thread-c (thread-a is oldest because thread-b was accessed most recently).
+    req_c = _make_tool_request(tool_name="read_file", runtime=rt_c)
+    mw.wrap_tool_call(req_c, lambda r: good_msg)
+
+    # thread-c must now have a real entry (not an empty phantom).
+    assert "thread-c" in mw._phase_states
+    assert mw._phase_states["thread-c"].get("read_file") is not None
+
+    # No more than max_tracked_threads entries should exist.
+    assert len(mw._phase_states) <= 2
 
 
 def test_lru_eviction_of_oldest_thread():
@@ -514,6 +634,41 @@ def test_lru_eviction_of_oldest_thread():
     assert "thread-0" not in mw._phase_states
     assert "thread-1" in mw._phase_states
     assert "thread-2" in mw._phase_states
+
+
+def test_pending_evicted_with_phase_states_on_lru_overflow():
+    """M1 regression: _pending keys for evicted threads must be cleaned up.
+
+    When _phase_states evicts a thread via LRU, any pending hint entries
+    for that thread must also be removed so _pending cannot grow unboundedly.
+    """
+    mw = _make_mw(max_tracked_threads=2, stagnation_threshold=2)
+    error_msg = _make_error_message()
+
+    # Thread-0: produce a hint (reach WARNED) so it has a pending entry.
+    rt0 = _make_runtime(thread_id="thread-0", run_id="run-0")
+    req0 = _make_tool_request(runtime=rt0)
+    mw.wrap_tool_call(req0, lambda r: error_msg)
+    mw.wrap_tool_call(req0, lambda r: error_msg)
+    # Verify thread-0 has a pending hint.
+    assert len(mw._pending.get(("thread-0", "run-0"), [])) >= 1
+
+    # Thread-1: occupy the second slot.
+    rt1 = _make_runtime(thread_id="thread-1", run_id="run-1")
+    req1 = _make_tool_request(runtime=rt1)
+    good_msg = _make_tool_message("A" * 300)
+    mw.wrap_tool_call(req1, lambda r: good_msg)
+
+    # Thread-2: adding this forces LRU eviction of thread-0.
+    rt2 = _make_runtime(thread_id="thread-2", run_id="run-2")
+    req2 = _make_tool_request(runtime=rt2)
+    mw.wrap_tool_call(req2, lambda r: good_msg)
+
+    # thread-0 must be evicted from phase_states.
+    assert "thread-0" not in mw._phase_states
+
+    # The pending entry for thread-0 must also be gone (no memory leak).
+    assert ("thread-0", "run-0") not in mw._pending, "_pending entry for evicted thread-0 should have been cleaned up"
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +726,41 @@ def test_partial_success_hint_is_specific_not_generic():
     assert "not producing new information" not in hints[0]
 
 
+def test_jaccard_near_dup_hint_is_specific_and_actionable():
+    """Near-duplicate success hint must be specific (not generic fallback) and include action guidance.
+
+    Before the fix, status='success'/error_type=None fell through to the generic fallback
+    '[PROGRESS HINT] The tool is not producing new information.' with no action suffix
+    (recommended_next_action='continue' was absent from action_map).  The fix adds a
+    'success' key to the base dict and a 'continue' key to the action_map.
+    """
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5, jaccard_threshold=0.8, min_words=5)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+
+    # First call: good unique content to seed recent_word_sets.
+    words = "apple banana cherry delta echo foxtrot golf hotel india juliet"
+    good_msg = _make_tool_message(words)
+    mw.wrap_tool_call(req, lambda r: good_msg)
+
+    # Second and third calls: exact same content → near-duplicate → stagnation_threshold=2 → WARNED.
+    dup_msg = _make_tool_message(words)
+
+    def handler(_r):
+        return dup_msg
+
+    mw.wrap_tool_call(req, handler)
+    mw.wrap_tool_call(req, handler)
+
+    hints = mw._drain_pending(rt)
+    assert len(hints) == 1
+    hint = hints[0]
+    # Must contain a specific near-dup message, not the generic fallback.
+    assert "duplicate" in hint.lower(), f"expected 'duplicate' in hint, got: {hint!r}"
+    # Must include an actionable suggestion (from action_map["continue"]).
+    assert "rephras" in hint.lower() or "different" in hint.lower(), f"expected action guidance in hint, got: {hint!r}"
+
+
 def test_no_hint_when_inject_assessment_disabled():
     mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5, inject_assessment=False)
     rt = _make_runtime()
@@ -582,6 +772,138 @@ def test_no_hint_when_inject_assessment_disabled():
 
     hints = mw._drain_pending(rt)
     assert hints == []
+
+
+def test_augment_request_deduplicates_identical_hints():
+    """L2: _augment_request must deduplicate identical hint strings via dict.fromkeys.
+
+    If the same hint text appears multiple times in the queue (e.g. two successive
+    no_results errors produce identical hint strings), only one copy should be
+    injected into the model message.
+    """
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5, inject_assessment=True)
+    rt = _make_runtime()
+
+    # Manually queue two identical hints to simulate duplicates.
+    mw._queue_assessment(rt, "[PROGRESS HINT] same hint text")
+    mw._queue_assessment(rt, "[PROGRESS HINT] same hint text")
+
+    model_req = _make_model_request([], rt)
+    captured: list = []
+
+    def model_handler(r):
+        captured.extend(r.messages)
+        return MagicMock()
+
+    mw.wrap_model_call(model_req, model_handler)
+
+    hint_msgs = [m for m in captured if isinstance(m, HumanMessage)]
+    assert len(hint_msgs) == 1
+    # The single injected message must contain the hint exactly once.
+    assert hint_msgs[0].content.count("[PROGRESS HINT] same hint text") == 1
+
+
+# ---------------------------------------------------------------------------
+# L1: _assess_and_transition called with already-blocked state is idempotent
+
+
+def test_assess_and_transition_blocked_state_immediate_stop_is_idempotent():
+    """L1: _assess_and_transition must handle an already-blocked state without error.
+
+    The docstring states the immediate-block branch re-applies idempotently.
+    This test verifies that re-entering with a blocked state + stop-action meta
+    stays blocked and does not corrupt the block_reason.
+    """
+    from deerflow.agents.middlewares.tool_progress_middleware import ToolPhaseState
+
+    mw = _make_mw()
+    blocked_state = ToolPhaseState(
+        phase="blocked",
+        consecutive_problems=5,
+        block_reason="Authentication failure — this tool cannot be used.",
+    )
+    auth_meta_kwargs = _meta_kwargs(
+        status="error",
+        error_type="auth",
+        recoverable_by_model=False,
+        recommended_next_action="stop",
+    )[TOOL_META_KEY]
+    from deerflow.agents.middlewares.tool_result_meta import ToolResultMeta
+
+    auth_meta = ToolResultMeta(**auth_meta_kwargs)
+
+    new_state, hint = mw._assess_and_transition(blocked_state, auth_meta, "")
+
+    assert new_state.phase == "blocked"
+    assert new_state.block_reason is not None
+    assert hint is None  # no hint on immediate block path
+
+
+def test_assess_and_transition_blocked_state_non_stop_increments_count():
+    """L1: A blocked state receiving a non-stop problem increments counter, stays blocked.
+
+    Simulates a concurrent race where two threads both process results for the
+    same tool: the second thread's _assess_and_transition receives a stale
+    'blocked' snapshot.  The result must remain blocked.
+    """
+    from deerflow.agents.middlewares.tool_progress_middleware import ToolPhaseState
+
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1)
+    blocked_state = ToolPhaseState(
+        phase="blocked",
+        consecutive_problems=3,
+        block_reason="Repeated rate-limiting — summarize current findings and proceed.",
+    )
+    rate_meta_kwargs = _meta_kwargs(
+        status="error",
+        error_type="rate_limited",
+        recoverable_by_model=False,
+        recommended_next_action="summarize",
+    )[TOOL_META_KEY]
+    from deerflow.agents.middlewares.tool_result_meta import ToolResultMeta
+
+    rate_meta = ToolResultMeta(**rate_meta_kwargs)
+
+    new_state, _hint = mw._assess_and_transition(blocked_state, rate_meta, "")
+
+    # Must stay blocked (not regress to warned or active).
+    assert new_state.phase == "blocked"
+    # Counter must NOT be incremented: blocked is terminal, state returned unchanged.
+    assert new_state.consecutive_problems == 3
+
+
+def test_assess_and_transition_blocked_recoverable_does_not_regress_to_warned():
+    """L1: A blocked state with recoverable errors must not silently regress to warned.
+
+    Before the fix, _assess_and_transition had no guard for already-blocked states.
+    A recoverable error arriving on a blocked state (concurrent race) would take
+    the `warned` branch because recoverable_by_model=True, demoting the phase from
+    blocked back to warned. This test locks the fixed behavior.
+    """
+    from deerflow.agents.middlewares.tool_progress_middleware import ToolPhaseState
+
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1)
+    blocked_state = ToolPhaseState(
+        phase="blocked",
+        consecutive_problems=5,
+        block_reason="Repeated no-results — rewrite your query or try a different tool.",
+    )
+    # Recoverable no_results error (would normally only WARN, never block on its own)
+    no_results_meta_kwargs = _meta_kwargs(
+        status="error",
+        error_type="no_results",
+        recoverable_by_model=True,
+        recommended_next_action="rewrite_query",
+    )[TOOL_META_KEY]
+    from deerflow.agents.middlewares.tool_result_meta import ToolResultMeta
+
+    no_results_meta = ToolResultMeta(**no_results_meta_kwargs)
+
+    new_state, hint = mw._assess_and_transition(blocked_state, no_results_meta, "")
+
+    assert new_state.phase == "blocked", "blocked must not regress to warned even when the new error is recoverable"
+    assert hint is None
+    assert new_state is blocked_state  # exact same object returned (no copy)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +959,37 @@ def test_from_config():
     assert mw._warn_escalation == 3
     assert mw._jaccard_threshold == pytest.approx(0.7)
     assert mw._min_words == 8
+
+
+def test_from_config_empty_exempt_tools_clears_exemptions():
+    """Empty exempt_tools in config must produce an empty set, not the default fallback.
+
+    H1 regression: `exempt_tools or {default}` would silently ignore an empty set
+    because set() is falsy in Python. The fix uses `is not None` so an explicit
+    empty set from config actually disables all exemptions.
+    """
+    from deerflow.config.tool_progress_config import ToolProgressConfig
+
+    cfg = ToolProgressConfig(enabled=True, exempt_tools=set())
+    mw = ToolProgressMiddleware.from_config(cfg)
+    assert mw._exempt_tools == set(), "empty exempt_tools in config must clear all exemptions, not fall back to defaults"
+
+
+def test_exempt_tools_none_uses_defaults():
+    """None exempt_tools in __init__ must use the built-in default set."""
+    mw = ToolProgressMiddleware(exempt_tools=None)
+    assert "ask_clarification" in mw._exempt_tools
+    assert "write_todos" in mw._exempt_tools
+    assert "present_files" in mw._exempt_tools
+
+
+def test_from_config_default_exempt_tools_round_trip():
+    """Default exempt_tools from config must match the __init__ default."""
+    from deerflow.config.tool_progress_config import ToolProgressConfig
+
+    cfg = ToolProgressConfig(enabled=True)
+    mw = ToolProgressMiddleware.from_config(cfg)
+    assert mw._exempt_tools == {"ask_clarification", "write_todos", "present_files"}
 
 
 # ---------------------------------------------------------------------------
@@ -794,3 +1147,109 @@ async def test_awrap_model_call_drains_and_injects_hints():
 
     hint_msgs = [m for m in captured if isinstance(m, HumanMessage)]
     assert any("PROGRESS HINT" in m.content for m in hint_msgs)
+
+
+# ---------------------------------------------------------------------------
+# Logging behavior
+
+_MW_LOGGER = "deerflow.agents.middlewares.tool_progress_middleware"
+
+
+def test_log_active_to_warned_emits_info(caplog):
+    mw = _make_mw(stagnation_threshold=2)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_error_message()
+
+    with caplog.at_level(logging.INFO, logger=_MW_LOGGER):
+        mw.wrap_tool_call(req, lambda _r: error_msg)
+        mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    info_records = [r for r in caplog.records if r.levelname == "INFO" and "WARNED" in r.message]
+    assert len(info_records) == 1
+    assert "web_search" in info_records[0].message
+
+
+def test_log_immediate_block_emits_warning(caplog):
+    mw = _make_mw(stagnation_threshold=5)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    auth_msg = _make_error_message(
+        error_type="auth",
+        recoverable_by_model=False,
+        recommended_next_action="stop",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_MW_LOGGER):
+        mw.wrap_tool_call(req, lambda _r: auth_msg)
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING" and "BLOCKED" in r.message]
+    assert len(warning_records) == 1
+    assert "web_search" in warning_records[0].message
+
+
+def test_log_escalation_block_emits_warning(caplog):
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=2)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_non_recoverable_error_message()
+
+    with caplog.at_level(logging.WARNING, logger=_MW_LOGGER):
+        for _ in range(4):
+            mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING" and "BLOCKED" in r.message]
+    assert len(warning_records) == 1
+
+
+def test_log_blocked_call_intercepted_emits_info(caplog):
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_non_recoverable_error_message()
+
+    for _ in range(3):
+        mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    with caplog.at_level(logging.INFO, logger=_MW_LOGGER):
+        mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    intercepted = [r for r in caplog.records if "intercepted" in r.message and "web_search" in r.message]
+    assert len(intercepted) == 1
+
+
+def test_log_warned_to_active_reset_emits_info(caplog):
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_error_message()
+    good_msg = _make_tool_message("A" * 300)
+
+    # Drive to WARNED
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    with caplog.at_level(logging.INFO, logger=_MW_LOGGER):
+        mw.wrap_tool_call(req, lambda _r: good_msg)
+
+    reset_records = [r for r in caplog.records if r.levelname == "INFO" and "ACTIVE" in r.message]
+    assert len(reset_records) == 1
+    assert "web_search" in reset_records[0].message
+
+
+def test_log_hint_injection_emits_debug(caplog):
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_error_message()
+
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    model_req = _make_model_request([], rt)
+    with caplog.at_level(logging.DEBUG, logger=_MW_LOGGER):
+        mw.wrap_model_call(model_req, lambda _r: MagicMock())
+
+    debug_records = [r for r in caplog.records if r.levelname == "DEBUG" and "injecting" in r.message]
+    assert len(debug_records) == 1
+    assert "injecting 1 hint" in debug_records[0].message

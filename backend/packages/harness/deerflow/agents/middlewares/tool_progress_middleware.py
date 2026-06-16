@@ -31,7 +31,7 @@ import logging
 import re
 import threading
 from collections import OrderedDict, defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, override
 
@@ -64,7 +64,10 @@ class ToolPhaseState:
     phase: Literal["active", "warned", "blocked"] = "active"
     consecutive_problems: int = 0
     block_reason: str | None = None
-    recent_word_sets: list[frozenset[str]] = field(default_factory=list)
+    # Immutable tuple so that dataclasses.replace() calls that omit recent_word_sets
+    # (problem paths) cannot accidentally share a mutable list between the old and new
+    # state objects and cause silent cross-state corruption via .append().
+    recent_word_sets: tuple[frozenset[str], ...] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +81,7 @@ def word_set(content: str) -> frozenset[str]:
 
 def is_near_duplicate(
     current: frozenset[str],
-    recent: list[frozenset[str]],
+    recent: Sequence[frozenset[str]],
     threshold: float,
     min_words: int,
 ) -> bool:
@@ -121,6 +124,9 @@ def _format_hint(meta: ToolResultMeta) -> str:
         "try_alternative": "Consider using a different tool or strategy.",
         "summarize": "Consider summarizing your current findings and moving forward.",
         "stop": "Do not retry this operation — it is not recoverable.",
+        # Near-duplicate success results: recommended_next_action is "continue" by default,
+        # but the model should still change strategy to avoid re-fetching the same content.
+        "continue": "Try rephrasing your query or using a different search term.",
     }
     base = {
         "no_results": "[PROGRESS HINT] Your search returned no results.",
@@ -128,6 +134,8 @@ def _format_hint(meta: ToolResultMeta) -> str:
         "rate_limited": "[PROGRESS HINT] The tool is being rate-limited.",
         "transient": "[PROGRESS HINT] The tool encountered repeated transient failures.",
         "partial_success": "[PROGRESS HINT] The tool has returned incomplete results multiple times.",
+        # Jaccard near-duplicate success: the tool is returning the same content repeatedly.
+        "success": "[PROGRESS HINT] The tool is returning duplicate results.",
     }.get(
         meta.error_type or meta.status,
         "[PROGRESS HINT] The tool is not producing new information.",
@@ -174,7 +182,7 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         self._inject_assessment = inject_assessment
         self._jaccard_threshold = jaccard_threshold
         self._min_words = min_words
-        self._exempt_tools: set[str] = exempt_tools or {"ask_clarification", "write_todos", "present_files"}
+        self._exempt_tools: set[str] = exempt_tools if exempt_tools is not None else {"ask_clarification", "write_todos", "present_files"}
         self._max_tracked_threads = max_tracked_threads
 
         self._lock = threading.Lock()
@@ -218,7 +226,10 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         if thread_id not in self._phase_states:
             self._phase_states[thread_id] = {}
             while len(self._phase_states) > self._max_tracked_threads:
-                self._phase_states.popitem(last=False)
+                evicted_thread, _ = self._phase_states.popitem(last=False)
+                # Evict pending hints for the evicted thread to prevent unbounded growth.
+                for key in [k for k in self._pending if k[0] == evicted_thread]:
+                    del self._pending[key]
         self._phase_states.move_to_end(thread_id)
         return self._phase_states[thread_id].get(tool_name, ToolPhaseState())
 
@@ -228,8 +239,12 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
     def _get_block_reason(self, runtime: Runtime, tool_name: str) -> str | None:
         thread_id = self._thread_id(runtime)
         with self._lock:
-            state = self._get_state(thread_id, tool_name)
-        return state.block_reason if state.phase == "blocked" else None
+            thread_tools = self._phase_states.get(thread_id)
+            if thread_tools is None:
+                return None
+            self._phase_states.move_to_end(thread_id)
+            tool_state = thread_tools.get(tool_name)
+            return tool_state.block_reason if tool_state is not None and tool_state.phase == "blocked" else None
 
     def _make_blocked_message(self, request: ToolCallRequest, tool_name: str, block_reason: str) -> ToolMessage:
         return ToolMessage(
@@ -267,6 +282,27 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             state = self._get_state(thread_id, tool_name)
             new_state, hint = self._assess_and_transition(state, meta, content)
             self._set_state(thread_id, tool_name, new_state)
+        if new_state.phase != state.phase:
+            if new_state.phase == "blocked":
+                logger.warning(
+                    "tool_progress: %s/%s -> BLOCKED: %s",
+                    thread_id,
+                    tool_name,
+                    new_state.block_reason,
+                )
+            elif new_state.phase == "warned":
+                logger.info(
+                    "tool_progress: %s/%s -> WARNED (consecutive_problems=%d)",
+                    thread_id,
+                    tool_name,
+                    new_state.consecutive_problems,
+                )
+            elif new_state.phase == "active":
+                logger.info(
+                    "tool_progress: %s/%s -> ACTIVE (reset after good result)",
+                    thread_id,
+                    tool_name,
+                )
         if hint and self._inject_assessment:
             self._queue_assessment(runtime, hint)
         return result
@@ -282,11 +318,20 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
     ) -> tuple[ToolPhaseState, str | None]:
         """Return (new_state, hint_text_or_None).
 
-        Precondition: callers must not pass a state whose phase is already
-        "blocked" — the outer wrap_tool_call gate intercepts those before
-        reaching this function, so a blocked state here would indicate a
-        caller bug.
+        The outer wrap_tool_call gate intercepts already-blocked states before
+        the handler is called, so this function is normally reached only for
+        active/warned states. If a blocked state arrives (e.g., concurrent
+        transition), the function returns it unchanged — no counter inflation,
+        no phase regression.
         """
+        # Guard: blocked is a terminal state; nothing should change it here.
+        # (In normal flow this branch is unreachable because wrap_tool_call
+        # intercepts blocked tools before calling the handler.  The check exists
+        # to make concurrent-race semantics well-defined and prevent a
+        # recoverable-error result from silently demoting the phase back to warned.)
+        if state.phase == "blocked":
+            return state, None
+
         # Immediately block on unrecoverable stop signals (auth, config, internal).
         if not meta.recoverable_by_model and meta.recommended_next_action == "stop":
             return replace(
@@ -300,7 +345,7 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
 
         if not is_problem:
             # Good result: reset consecutive count, return to active.
-            new_recent = (state.recent_word_sets + [ws])[-5:]
+            new_recent = (*state.recent_word_sets, ws)[-3:]
             return replace(state, consecutive_problems=0, phase="active", recent_word_sets=new_recent), None
 
         new_count = state.consecutive_problems + 1
@@ -363,6 +408,12 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             return handler(request)
         block_reason = self._get_block_reason(runtime, tool_name)
         if block_reason:
+            logger.info(
+                "tool_progress: %s/%s call intercepted (blocked): %s",
+                self._thread_id(runtime),
+                tool_name,
+                block_reason,
+            )
             return self._make_blocked_message(request, tool_name, block_reason)
         return self._update_state_from_result(handler(request), tool_name, runtime)
 
@@ -380,6 +431,12 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             return await handler(request)
         block_reason = self._get_block_reason(runtime, tool_name)
         if block_reason:
+            logger.info(
+                "tool_progress: %s/%s call intercepted (blocked): %s",
+                self._thread_id(runtime),
+                tool_name,
+                block_reason,
+            )
             return self._make_blocked_message(request, tool_name, block_reason)
         return self._update_state_from_result(await handler(request), tool_name, runtime)
 
@@ -391,6 +448,11 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         if not hints:
             return request
         deduped = list(dict.fromkeys(hints))
+        logger.debug(
+            "tool_progress: injecting %d hint(s) for %s/%s",
+            len(deduped),
+            *self._pending_key(request.runtime),
+        )
         new_messages = [
             *request.messages,
             HumanMessage(content="\n\n".join(deduped), name="progress_hint"),
