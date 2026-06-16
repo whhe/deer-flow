@@ -77,9 +77,12 @@ def test_auth_error_is_not_retryable_and_stop():
 
 
 def test_no_api_key_is_config_not_auth():
-    # "no api key" contains "api key" as a substring; the config rule must match
-    # before the auth rule so the block reason reads "not configured" rather than
-    # "authentication failure".
+    # Distinguish "missing key" (config) from "wrong key" (auth):
+    # - auth rule keyword: "invalid api key"  (key provided but rejected)
+    # - config rule keyword: "no api key"      (key not set at all)
+    # The two phrases do not overlap, so rule order does not affect this particular
+    # case.  This test documents the semantic distinction — a missing API key is a
+    # configuration issue, not an authentication failure.
     msg = _make_msg("Error: no api key configured", status="error")
     result = normalize_tool_message(msg)
     m = _meta(result)
@@ -105,23 +108,49 @@ def test_no_results_suggests_rewrite_query():
 
 
 # ---------------------------------------------------------------------------
-# Exception path (status="error", no "Error:" prefix)
+# Non-standard error path (status="error", no "Error:" prefix)
 
 
-def test_exception_path_classifies_from_content():
+def test_nonstd_error_status_classifies_from_content():
+    # Tools that return status="error" without the "Error:" prefix are tool_return, not exception.
+    # Actual exceptions are pre-stamped by stamp_exception_meta and exit normalize_tool_message early.
     msg = _make_msg("ConnectionError: connection refused", status="error")
     result = normalize_tool_message(msg)
     m = _meta(result)
     assert m["status"] == "error"
-    assert m["source"] == "exception"
+    assert m["source"] == "tool_return"
     assert m["error_type"] == "transient"
 
 
-def test_exception_path_timeout_content():
+def test_nonstd_error_status_timeout_content():
     msg = _make_msg("timeout occurred", status="error")
     result = normalize_tool_message(msg)
     m = _meta(result)
-    assert m["source"] == "exception"
+    assert m["source"] == "tool_return"
+    assert m["error_type"] == "transient"
+
+
+def test_nonstd_error_status_json_classifies_from_error_field():
+    # When status="error" and content is JSON, classification must use only the "error"
+    # field value — not keywords that appear in other fields like "query".
+    content = '{"error": "api limit exceeded", "query": "connection test timeout"}'
+    msg = _make_msg(content, status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["source"] == "tool_return"
+    # "connection" and "timeout" in query must not trigger transient; the error field
+    # "api limit exceeded" doesn't match any rule → unknown.
+    assert m["error_type"] == "unknown"
+
+
+def test_nonstd_error_status_json_no_error_key_falls_back_to_content():
+    # JSON without an "error" key falls back to classifying the full content string.
+    content = '{"message": "connection refused"}'
+    msg = _make_msg(content, status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
     assert m["error_type"] == "transient"
 
 
@@ -230,3 +259,123 @@ def test_normalize_tool_result_stamps_tool_message():
     result = normalize_tool_result(msg)
     assert isinstance(result, ToolMessage)
     assert TOOL_META_KEY in result.additional_kwargs
+
+
+# ---------------------------------------------------------------------------
+# JSON-wrapped error detection
+
+
+def test_normalize_json_error_config_classified_as_error():
+    content = '{"error": "BRAVE_SEARCH_API_KEY is not configured", "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == "config"
+    assert m["source"] == "tool_return"
+
+
+def test_normalize_json_error_no_results_classified_correctly():
+    content = '{"error": "No results found", "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == "no_results"
+    assert m["recoverable_by_model"] is True
+
+
+def test_normalize_json_null_error_not_treated_as_error():
+    content = '{"error": null, "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] != "error"
+
+
+def test_normalize_json_no_error_key_not_treated_as_error():
+    content = '{"results": [{"title": "page one", "url": "https://example.com/one", "content": "summary one"}], "total": 1}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "success"
+
+
+def test_normalize_malformed_json_not_treated_as_error():
+    content = '{"error": "broken json'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] != "error"
+
+
+def test_normalize_json_error_with_leading_whitespace():
+    content = '  {"error": "No results found", "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == "no_results"
+
+
+def test_normalize_json_numeric_error_classified_correctly():
+    content = '{"error": 404, "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == "not_found"
+
+
+def test_normalize_json_zero_error_not_treated_as_error():
+    content = '{"error": 0, "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] != "error"
+
+
+def test_normalize_json_false_error_not_treated_as_error():
+    content = '{"error": false, "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] != "error"
+
+
+def test_normalize_json_boolean_true_error_classified_as_unknown():
+    """Boolean True in the error field means 'an error occurred' and must be classified.
+
+    str(True) = "True" which matches no keyword rule, so the result is error/unknown.
+    This is intentional: a boolean True error is a real error with no further detail.
+    """
+    content = '{"error": true, "query": "test"}'
+    msg = _make_msg(content)
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == "unknown"  # str(True)="True" matches no keyword rule
+    assert m["recoverable_by_model"] is True
+    assert m["recommended_next_action"] == "try_alternative"
+
+
+# ---------------------------------------------------------------------------
+# M2 regression: semantic-zero error strings must NOT be treated as errors
+
+
+@pytest.mark.parametrize(
+    "error_value",
+    ["none", "None", "NONE", "null", "Null", "false", "False", "no", "ok", "success", "n/a", ""],
+)
+def test_normalize_json_semantic_zero_error_string_not_treated_as_error(error_value: str):
+    """M2 regression: error field containing a conventional 'no-error' string must not trigger misclassification.
+
+    Tools sometimes return {"error": "none", "results": [...]} on success.
+    The string "none" is truthy in Python, so without this guard the message
+    would have been classified as error (unknown), inflating stagnation counters.
+    """
+    content = f'{{"error": {error_value!r}, "results": ["item1", "item2", "item3"]}}'
+    msg = _make_msg(content, status="success")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] != "error", f'error="{error_value}" should not be treated as an error; got status={m["status"]!r}'

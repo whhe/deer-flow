@@ -7,6 +7,7 @@ Every tool result that passes through ToolErrorHandlingMiddleware gets a
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -73,6 +74,30 @@ _UNKNOWN_ERROR: dict[str, object] = {
 }
 
 
+_SEMANTIC_ZERO_ERROR_STRINGS: frozenset[str] = frozenset({"none", "null", "false", "no", "ok", "success", "n/a", ""})
+
+
+def _extract_json_error_text(content: str) -> str | None:
+    """Return the error string from a JSON-wrapped error like {"error": "...", "query": "..."}.
+
+    Returns None when the ``error`` field is falsy (JSON null / 0 / false / empty
+    string) or is a sentinel string that conventionally means "no error" (e.g.
+    ``"none"``, ``"null"``, ``"false"``).  This prevents tools that return
+    ``{"error": "none", "results": [...]}`` on success from being misclassified
+    as errors.
+    """
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    if not error:
+        return None
+    if isinstance(error, str) and error.lower().strip() in _SEMANTIC_ZERO_ERROR_STRINGS:
+        return None
+    return str(error)
+
+
 def _classify_error_text(text: str) -> dict[str, object]:
     lower = text.lower()
     for keywords, attrs in _ERROR_RULES:
@@ -93,7 +118,12 @@ def _make_meta(*, status: str, source: str, error_type: str | None = None, retry
 
 
 def stamp_exception_meta(msg: ToolMessage, exc_info: str) -> ToolMessage:
-    """Stamp deerflow_tool_meta with source='exception' onto an exception-derived ToolMessage."""
+    """Stamp deerflow_tool_meta with source='exception' onto an exception-derived ToolMessage.
+
+    Unlike normalize_tool_message (which preserves existing stamps), this function always
+    overwrites any pre-existing TOOL_META_KEY entry.  Exception-derived classification is
+    more authoritative than a tool's own return-time stamp.
+    """
     attrs = _classify_error_text(exc_info)
     updated_kwargs = dict(msg.additional_kwargs or {})
     updated_kwargs[TOOL_META_KEY] = _make_meta(status="error", source="exception", **attrs)
@@ -112,11 +142,17 @@ def normalize_tool_message(msg: ToolMessage) -> ToolMessage:
     # Non-standard error: tool returned status="error" without the "Error:" prefix convention.
     # (Actual exceptions from ToolErrorHandlingMiddleware are pre-stamped by stamp_exception_meta
     # and exit early above — they never reach this branch.)
+    # Try JSON extraction first so classification uses only the "error" field value, not
+    # keywords that appear incidentally in other JSON fields (e.g. "query").
     if msg.status == "error" and not content.startswith(_ERROR_PREFIX):
-        attrs = _classify_error_text(content)
-        meta = _make_meta(status="error", source="exception", **attrs)
+        json_error = _extract_json_error_text(content)
+        attrs = _classify_error_text(json_error if json_error is not None else content)
+        meta = _make_meta(status="error", source="tool_return", **attrs)
     elif content.startswith(_ERROR_PREFIX):
         attrs = _classify_error_text(content[len(_ERROR_PREFIX) :])
+        meta = _make_meta(status="error", source="tool_return", **attrs)
+    elif (json_error := _extract_json_error_text(content)) is not None:
+        attrs = _classify_error_text(json_error)
         meta = _make_meta(status="error", source="tool_return", **attrs)
     elif any(m in content.lower() for m in _PARTIAL_MARKERS) or (0 < len(content) < _MIN_SUBSTANTIAL_CONTENT):
         meta = _make_meta(
