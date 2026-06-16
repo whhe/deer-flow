@@ -20,11 +20,6 @@ class ToolProgressConfig(BaseModel):
         ge=1,
         description="Additional problem occurrences after WARNED before escalating to BLOCKED",
     )
-    max_calls_per_intent: int = Field(
-        default=5,
-        ge=1,
-        description="Retained for backward compatibility; not used by the current state machine",
-    )
     inject_assessment: bool = Field(
         default=True,
         description="Whether to inject progress assessment hints into model requests",
@@ -47,9 +42,4 @@ class ToolProgressConfig(BaseModel):
         default=100,
         ge=1,
         description="Maximum number of thread histories to keep in memory (LRU eviction)",
-    )
-    window_size: int = Field(
-        default=30,
-        ge=1,
-        description="Retained for backward compatibility; not used by the current state machine",
     )

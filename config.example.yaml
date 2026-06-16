@@ -759,12 +759,10 @@ loop_detection:
 #   enabled: false
 #   stagnation_threshold: 3        # Consecutive problems before WARNED
 #   warn_escalation_count: 2       # More problems after WARNED before BLOCKED
-#   max_calls_per_intent: 5        # Retained for backward compat; unused
 #   inject_assessment: true
 #   jaccard_similarity_threshold: 0.8  # Word-set similarity threshold for near-duplicate detection
 #   min_word_count_for_similarity: 10  # Min unique words to apply Jaccard check
 #   max_tracked_threads: 100
-#   window_size: 30                # Retained for backward compat; unused
 #   exempt_tools:
 #     - ask_clarification
 #     - write_todos
