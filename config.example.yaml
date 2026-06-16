@@ -738,8 +738,11 @@ loop_detection:
 # Tool Progress State Machine Configuration (RFC #3177)
 # ============================================================================
 # Detects tool stagnation and repetition at the (thread, tool) level.
-# Tracks consecutive "no-new-info" calls and transitions through:
-#   ACTIVE → WARNED (hint injected) → BLOCKED (tool call intercepted).
+# Tracks consecutive "no-new-info" calls (error, partial_success, near-duplicate success).
+# Three transition paths (determined by deerflow_tool_meta.recoverable_by_model):
+#   recoverable=true  (no_results, not_found, permission): ACTIVE → WARNED (terminal; hint re-injected each call)
+#   recoverable=false (rate_limited, transient):           ACTIVE → WARNED → BLOCKED after warn_escalation_count more
+#   recoverable=false + action=stop (auth, config):        ACTIVE → BLOCKED immediately
 # Requires ToolErrorHandlingMiddleware to be active (always on).
 
 # tool_progress:

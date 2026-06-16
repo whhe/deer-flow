@@ -11,9 +11,18 @@ Architecture:
   ToolProgressMiddleware reads deerflow_tool_meta from the normalized result
 
 State machine transitions per (thread_id, tool_name):
-  ACTIVE → WARNED (at stagnation_threshold problems) → BLOCKED (after warn_escalation_count more)
+  ACTIVE → WARNED (at stagnation_threshold problems)
   Any problem-free call resets consecutive_problems=0 and reverts to ACTIVE.
-  Auth/config errors are immediately BLOCKED (not recoverable by model).
+
+  Whether WARNED can escalate to BLOCKED depends on recoverable_by_model:
+  - recoverable_by_model=True  (no_results, not_found, permission, Jaccard-duplicate success):
+      WARNED is terminal. The model received a hint and is expected to change strategy;
+      blocking would prevent a legitimate retry with different parameters.
+  - recoverable_by_model=False, action≠stop (transient, rate_limited):
+      WARNED → BLOCKED after warn_escalation_count more problems. The model cannot fix
+      these by retrying the same tool, so hard-blocking conserves API calls.
+  - recoverable_by_model=False, action=stop (auth, config, internal):
+      Immediately BLOCKED on the first occurrence — no retry can help.
 """
 
 from __future__ import annotations
@@ -271,7 +280,13 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         meta: ToolResultMeta,
         content: str,
     ) -> tuple[ToolPhaseState, str | None]:
-        """Return (new_state, hint_text_or_None)."""
+        """Return (new_state, hint_text_or_None).
+
+        Precondition: callers must not pass a state whose phase is already
+        "blocked" — the outer wrap_tool_call gate intercepts those before
+        reaching this function, so a blocked state here would indicate a
+        caller bug.
+        """
         # Immediately block on unrecoverable stop signals (auth, config, internal).
         if not meta.recoverable_by_model and meta.recommended_next_action == "stop":
             return replace(
@@ -292,8 +307,15 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         hint: str | None = None
 
         if new_count >= self._stagnation_threshold + self._warn_escalation:
-            reason = _block_reason(meta)
-            new_state = replace(state, consecutive_problems=new_count, phase="blocked", block_reason=reason)
+            if meta.recoverable_by_model:
+                # Model can fix this by changing strategy — keep warned, re-inject hint.
+                # BLOCKED would prevent a legitimate retry with different parameters.
+                hint = _format_hint(meta)
+                new_state = replace(state, consecutive_problems=new_count, phase="warned")
+            else:
+                # Model cannot fix this by retrying — block the tool.
+                reason = _block_reason(meta)
+                new_state = replace(state, consecutive_problems=new_count, phase="blocked", block_reason=reason)
         elif new_count >= self._stagnation_threshold:
             hint = _format_hint(meta)
             new_state = replace(state, consecutive_problems=new_count, phase="warned")

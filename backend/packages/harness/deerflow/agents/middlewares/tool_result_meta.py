@@ -32,7 +32,7 @@ class ToolResultMeta:
 
 _ERROR_RULES: list[tuple[list[str], dict[str, object]]] = [
     (
-        ["401", "403", "unauthorized", "authentication", "invalid api key", "api key"],
+        ["401", "403", "unauthorized", "authentication", "invalid api key"],
         {"error_type": "auth", "retryable": False, "recoverable_by_model": False, "recommended_next_action": "stop"},
     ),
     (

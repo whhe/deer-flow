@@ -76,6 +76,18 @@ def test_auth_error_is_not_retryable_and_stop():
     assert m["recommended_next_action"] == "stop"
 
 
+def test_no_api_key_is_config_not_auth():
+    # "no api key" contains "api key" as a substring; the config rule must match
+    # before the auth rule so the block reason reads "not configured" rather than
+    # "authentication failure".
+    msg = _make_msg("Error: no api key configured", status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["error_type"] == "config", "missing API key is a config issue, not auth"
+    assert m["recommended_next_action"] == "stop"
+    assert m["recoverable_by_model"] is False
+
+
 def test_rate_limited_error_is_retryable():
     msg = _make_msg("Error: rate limited", status="error")
     result = normalize_tool_message(msg)

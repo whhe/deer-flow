@@ -70,6 +70,31 @@ def _make_tool_message(
     )
 
 
+def _make_non_recoverable_error_message(
+    content: str = "Error: rate limited",
+    *,
+    tool_name: str = "web_search",
+    error_type: str = "rate_limited",
+    recommended_next_action: str = "summarize",
+) -> ToolMessage:
+    """Non-recoverable stagnation error (recoverable_by_model=False, non-stop).
+    Unlike auth/config, these go through the stagnation counter, but should
+    still reach BLOCKED because the model cannot fix them by retrying.
+    """
+    return ToolMessage(
+        content=content,
+        tool_call_id=f"tc-{tool_name}",
+        name=tool_name,
+        status="error",
+        additional_kwargs=_meta_kwargs(
+            status="error",
+            error_type=error_type,
+            recoverable_by_model=False,
+            recommended_next_action=recommended_next_action,
+        ),
+    )
+
+
 def _make_error_message(
     content: str = "Error: no results found",
     *,
@@ -199,14 +224,16 @@ def test_repeated_no_results_reaches_warned():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 3: Additional calls after warned → blocked
+# Scenario 3: Non-recoverable errors escalate warned → blocked
 
 
 def test_warned_to_blocked_after_escalation():
     mw = _make_mw(stagnation_threshold=2, warn_escalation_count=2)
     rt = _make_runtime()
     req = _make_tool_request(runtime=rt)
-    error_msg = _make_error_message()
+    # Non-recoverable error (rate_limited): model cannot fix this by retrying,
+    # so stagnation should escalate to BLOCKED.
+    error_msg = _make_non_recoverable_error_message()
 
     def handler(_r):
         return error_msg
@@ -227,7 +254,8 @@ def test_blocked_tool_is_intercepted_without_calling_handler():
     mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1)
     rt = _make_runtime()
     req = _make_tool_request(runtime=rt)
-    error_msg = _make_error_message()
+    # Non-recoverable error: stagnation escalates to BLOCKED, handler is never called.
+    error_msg = _make_non_recoverable_error_message()
     call_count = [0]
 
     def handler(r):
@@ -247,6 +275,53 @@ def test_blocked_tool_is_intercepted_without_calling_handler():
     assert call_count[0] == call_count_before
     assert isinstance(result, ToolMessage)
     assert "[TOOL_BLOCKED]" in result.content
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4b: Recoverable errors never escalate to BLOCKED — WARNED is terminal
+
+
+def test_recoverable_errors_stay_warned_indefinitely():
+    # stagnation_threshold=2, warn_escalation_count=1 → would block at call 3 for
+    # non-recoverable errors, but recoverable errors must stay in WARNED forever.
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_error_message()  # recoverable_by_model=True
+
+    def handler(_r):
+        return error_msg
+
+    # 10 calls — well past the threshold+escalation
+    for _ in range(10):
+        mw.wrap_tool_call(req, handler)
+
+    state = mw._phase_states["t1"]["web_search"]
+    assert state.phase == "warned", "recoverable errors must never escalate to BLOCKED"
+    assert state.consecutive_problems == 10
+
+
+def test_recoverable_error_re_injects_hint_past_escalation():
+    # After crossing threshold+escalation for a recoverable error, each additional
+    # problem call should still queue a hint.
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1, inject_assessment=True)
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    error_msg = _make_error_message()
+
+    def handler(_r):
+        return error_msg
+
+    # Reach warned (call 2) and past escalation (call 3+)
+    for _ in range(4):
+        mw.wrap_tool_call(req, handler)
+
+    # All hints from call 2 onward should have been queued (capped at _MAX_PENDING_PER_RUN=3).
+    # >= 2 proves that at least one hint was queued *inside* the escalation zone (calls 3+),
+    # not just the initial WARNED hint at call 2.
+    hints = mw._drain_pending(rt)
+    assert len(hints) >= 2
+    assert all("PROGRESS HINT" in h for h in hints)
 
 
 # ---------------------------------------------------------------------------
@@ -315,16 +390,17 @@ def test_two_tools_have_independent_states():
     req_search = _make_tool_request("web_search", runtime=rt)
     req_read = _make_tool_request("read_file", runtime=rt)
 
-    error_search = _make_error_message(tool_name="web_search")
+    # Non-recoverable errors so web_search escalates to BLOCKED.
+    error_search = _make_non_recoverable_error_message(tool_name="web_search")
     error_read = _make_error_message(tool_name="read_file")
 
-    # Block web_search (2 → warned, 1 more → blocked)
+    # Drive web_search to BLOCKED (2 → warned, 1 more → blocked)
     for _ in range(3):
         mw.wrap_tool_call(req_search, lambda r: error_search)
 
     assert mw._phase_states["t1"]["web_search"].phase == "blocked"
 
-    # read_file should still be active
+    # read_file should still be active — independent state per tool name
     mw.wrap_tool_call(req_read, lambda r: error_read)
     assert mw._phase_states["t1"]["read_file"].phase == "active"
 
@@ -611,7 +687,8 @@ async def test_awrap_tool_call_blocked_intercepted_without_calling_handler():
     mw = _make_mw(stagnation_threshold=2, warn_escalation_count=1)
     rt = _make_runtime()
     req = _make_tool_request(runtime=rt)
-    error_msg = _make_error_message()
+    # Non-recoverable error: stagnation escalates to BLOCKED.
+    error_msg = _make_non_recoverable_error_message()
     call_count = [0]
 
     async def handler(r):
