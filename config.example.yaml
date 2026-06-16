@@ -712,6 +712,16 @@ tool_output:
   #   bash: 20000
 
 # ============================================================================
+# Suggestions Configuration
+# ============================================================================
+# Configure whether the agent automatically generates follow-up question
+# suggestions at the end of each response.
+
+suggestions:
+  enabled: true
+
+
+# ============================================================================
 # Loop Detection Configuration
 # ============================================================================
 # Detect and interrupt repeated identical tool-call loops.
