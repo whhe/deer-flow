@@ -51,6 +51,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_PENDING_PER_RUN = 3
+# Jaccard word-set computation is capped to avoid O(n) regex work on very large tool results.
+_MAX_CONTENT_FOR_WORDSET = 8192
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +77,13 @@ class ToolPhaseState:
 
 
 def word_set(content: str) -> frozenset[str]:
-    """Extract lowercase words of length >= 3 for Jaccard similarity."""
-    return frozenset(re.findall(r"\b\w{3,}\b", content.lower()))
+    """Extract lowercase words of length >= 3 for Jaccard similarity.
+
+    Content is capped at _MAX_CONTENT_FOR_WORDSET chars to bound memory and CPU cost on
+    large tool results (e.g. web pages).  Tail content beyond the cap is omitted from the
+    set, which is acceptable because duplicate-detection is a heuristic, not a guarantee.
+    """
+    return frozenset(re.findall(r"\b\w{3,}\b", content[:_MAX_CONTENT_FOR_WORDSET].lower()))
 
 
 def is_near_duplicate(
@@ -182,7 +189,7 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         self._inject_assessment = inject_assessment
         self._jaccard_threshold = jaccard_threshold
         self._min_words = min_words
-        self._exempt_tools: set[str] = exempt_tools if exempt_tools is not None else {"ask_clarification", "write_todos", "present_files"}
+        self._exempt_tools: set[str] = exempt_tools if exempt_tools is not None else {"ask_clarification", "write_todos", "present_files", "task"}
         self._max_tracked_threads = max_tracked_threads
 
         self._lock = threading.Lock()
@@ -242,7 +249,9 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             thread_tools = self._phase_states.get(thread_id)
             if thread_tools is None:
                 return None
-            self._phase_states.move_to_end(thread_id)
+            # Read-only check: do NOT call move_to_end here. Bumping recency on the read path
+            # would keep blocked threads permanently warm in the LRU, preventing healthy active
+            # threads from occupying those slots. Recency is updated only on _get_state writes.
             tool_state = thread_tools.get(tool_name)
             return tool_state.block_reason if tool_state is not None and tool_state.phase == "blocked" else None
 
@@ -256,7 +265,6 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
                 TOOL_META_KEY: {
                     "status": "error",
                     "error_type": "blocked_by_progress_guard",
-                    "retryable": False,
                     "recoverable_by_model": True,
                     "recommended_next_action": "summarize",
                     "source": "progress_middleware",
@@ -275,6 +283,11 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             return result
         meta = _parse_tool_meta((result.additional_kwargs or {}).get(TOOL_META_KEY))
         if meta is None:
+            if tool_name not in self._exempt_tools:
+                logger.warning(
+                    "tool_progress: deerflow_tool_meta missing for non-exempt tool %s — verify ToolProgressMiddleware is outer of ToolErrorHandlingMiddleware",
+                    tool_name,
+                )
             return result
         content = _message_content_str(result)
         thread_id = self._thread_id(runtime)
@@ -332,15 +345,22 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         if state.phase == "blocked":
             return state, None
 
+        # Count this call as a problem before branching so all exit paths leave
+        # consecutive_problems in a consistent state (never 0 when the tool has failed).
+        new_count = state.consecutive_problems + 1
+
         # Immediately block on unrecoverable stop signals (auth, config, internal).
         if not meta.recoverable_by_model and meta.recommended_next_action == "stop":
             return replace(
                 state,
                 phase="blocked",
+                consecutive_problems=new_count,
                 block_reason=_block_reason(meta),
             ), None
 
-        ws = word_set(content)
+        # Compute word_set only for success results: error/partial_success are problems by
+        # definition and never reach the Jaccard check, so the O(n) regex is wasted on them.
+        ws = word_set(content) if meta.status == "success" else frozenset()
         is_problem = meta.status in ("error", "partial_success") or (meta.status == "success" and is_near_duplicate(ws, state.recent_word_sets, self._jaccard_threshold, self._min_words))
 
         if not is_problem:
@@ -348,7 +368,6 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             new_recent = (*state.recent_word_sets, ws)[-3:]
             return replace(state, consecutive_problems=0, phase="active", recent_word_sets=new_recent), None
 
-        new_count = state.consecutive_problems + 1
         hint: str | None = None
 
         if new_count >= self._stagnation_threshold + self._warn_escalation:
@@ -374,7 +393,13 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
 
     def _queue_assessment(self, runtime: Runtime, text: str) -> None:
         key = self._pending_key(runtime)
+        thread_id = key[0]
         with self._lock:
+            # Guard against creating a phantom _pending entry for a thread that was just
+            # evicted from _phase_states by the LRU.  Such entries can never be cleaned up
+            # by the eviction loop (which only walks _phase_states) and accumulate silently.
+            if thread_id not in self._phase_states:
+                return
             queue = self._pending[key]
             if len(queue) < _MAX_PENDING_PER_RUN:
                 queue.append(text)
@@ -390,6 +415,33 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             for key in list(self._pending):
                 if key[0] == thread_id and key[1] != current_run:
                     del self._pending[key]
+
+    def _reset_blocked_states(self, runtime: Runtime) -> None:
+        """Reset BLOCKED and WARNED tool states for the thread at the start of a new run.
+
+        Both BLOCKED and WARNED are scoped to a single agent run:
+        - A BLOCKED tool must not stay blocked in the next run where the model has no memory
+          of the WARN hint that preceded it (auth/config errors re-block immediately anyway).
+        - A WARNED tool with accumulated consecutive_problems must not carry that count into
+          the next run; the model has not seen the warning context and would be hard-blocked
+          within a few calls without ever receiving a hint in the current session.
+        Jaccard recent_word_sets is also cleared so stale content windows from a prior run
+        do not cause false near-duplicate detections on the first success of the new run.
+        """
+        thread_id = self._thread_id(runtime)
+        with self._lock:
+            thread_tools = self._phase_states.get(thread_id)
+            if thread_tools is None:
+                return
+            for tool_name, tool_state in list(thread_tools.items()):
+                if tool_state.phase in ("blocked", "warned"):
+                    thread_tools[tool_name] = replace(
+                        tool_state,
+                        phase="active",
+                        consecutive_problems=0,
+                        block_reason=None,
+                        recent_word_sets=(),
+                    )
 
     # ------------------------------------------------------------------
     # wrap_tool_call
@@ -481,9 +533,11 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
     @override
     def before_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
         self._clear_stale_pending(runtime)
+        self._reset_blocked_states(runtime)
         return None
 
     @override
     async def abefore_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
         self._clear_stale_pending(runtime)
+        self._reset_blocked_states(runtime)
         return None

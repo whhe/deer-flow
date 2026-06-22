@@ -39,7 +39,6 @@ def _meta_kwargs(
     *,
     status: str = "success",
     error_type: str | None = None,
-    retryable: bool = False,
     recoverable_by_model: bool = True,
     recommended_next_action: str = "continue",
     source: str = "content_analysis",
@@ -48,7 +47,6 @@ def _meta_kwargs(
         TOOL_META_KEY: {
             "status": status,
             "error_type": error_type,
-            "retryable": retryable,
             "recoverable_by_model": recoverable_by_model,
             "recommended_next_action": recommended_next_action,
             "source": source,
@@ -359,6 +357,9 @@ def test_auth_error_immediately_blocked():
     state = mw._phase_states["t1"]["web_search"]
     assert state.phase == "blocked"
     assert "auth" in state.block_reason.lower() or "Authentication" in state.block_reason
+    # consecutive_problems must be 1 (not 0) even on immediate-block paths so diagnostic
+    # logs and future consumers see a consistent non-zero count after a failed call.
+    assert state.consecutive_problems == 1
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +568,9 @@ def test_before_agent_preserves_current_run_hints():
     # Hints for the *current* run must not be evicted.
     mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5)
     rt = _make_runtime(thread_id="t1", run_id="current-run")
+    # _queue_assessment guards against phantom entries by checking _phase_states; seed the
+    # thread so the direct call below isn't silently dropped by the L1 guard.
+    mw._phase_states["t1"] = {}
     mw._queue_assessment(rt, "current hint")
 
     state_mock = MagicMock()
@@ -574,6 +578,79 @@ def test_before_agent_preserves_current_run_hints():
 
     preserved = mw._pending.get(("t1", "current-run"), [])
     assert preserved == ["current hint"]
+
+
+def test_before_agent_resets_blocked_states_for_new_run():
+    """BLOCKED and WARNED tool states must both be cleared at the start of a new run.
+
+    A tool BLOCKED in run R1 must not silently remain blocked in R2.
+    A tool WARNED in R1 must not carry its consecutive_problems count into R2
+    (the model has not seen the warning context, so it would be hard-blocked
+    without ever receiving a hint in the current session).
+    recent_word_sets must also be cleared so stale Jaccard windows don't cause
+    false near-duplicate detections on the first success call of the new run.
+    """
+    mw = _make_mw(stagnation_threshold=1, warn_escalation_count=1)
+    rt_run1 = _make_runtime(thread_id="t1", run_id="run-1")
+    rt_run2 = _make_runtime(thread_id="t1", run_id="run-2")
+    req = _make_tool_request(runtime=rt_run1)
+
+    # Drive the tool to BLOCKED via auth error (immediate block, no WARN stage)
+    auth_msg = ToolMessage(
+        content="Error: invalid api key",
+        tool_call_id="tc-web_search",
+        name="web_search",
+        status="error",
+        additional_kwargs=_meta_kwargs(
+            status="error",
+            error_type="auth",
+            recoverable_by_model=False,
+            recommended_next_action="stop",
+        ),
+    )
+    mw.wrap_tool_call(req, lambda _r: auth_msg)
+    assert mw._phase_states["t1"]["web_search"].phase == "blocked"
+
+    # Simulate start of run 2
+    state_mock = MagicMock()
+    mw.before_agent(state_mock, rt_run2)
+
+    # _reset_blocked_states always replaces the entry in-place; it is never None.
+    tool_state = mw._phase_states.get("t1", {}).get("web_search")
+    assert tool_state is not None
+    assert tool_state.phase == "active"
+    assert tool_state.consecutive_problems == 0
+    assert tool_state.block_reason is None
+    assert tool_state.recent_word_sets == ()
+
+
+def test_before_agent_resets_warned_states_for_new_run():
+    """WARNED tool state must also be cleared by before_agent.
+
+    A tool with phase='warned' and accumulated consecutive_problems at end of run R1
+    must not carry that count into R2; the model has no warning context and would
+    be hard-blocked after just a few calls without receiving a hint.
+    """
+    mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5)
+    rt_run1 = _make_runtime(thread_id="t1", run_id="run-1")
+    rt_run2 = _make_runtime(thread_id="t1", run_id="run-2")
+    req = _make_tool_request(runtime=rt_run1)
+    error_msg = _make_error_message()
+
+    # Drive to WARNED (stagnation_threshold=2 means 2 problems → warned)
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+    assert mw._phase_states["t1"]["web_search"].phase == "warned"
+    assert mw._phase_states["t1"]["web_search"].consecutive_problems == 2
+
+    state_mock = MagicMock()
+    mw.before_agent(state_mock, rt_run2)
+
+    tool_state = mw._phase_states.get("t1", {}).get("web_search")
+    assert tool_state is not None
+    assert tool_state.phase == "active"
+    assert tool_state.consecutive_problems == 0
+    assert tool_state.recent_word_sets == ()
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +861,9 @@ def test_augment_request_deduplicates_identical_hints():
     mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5, inject_assessment=True)
     rt = _make_runtime()
 
+    # _queue_assessment guards against phantom entries; seed the thread so the direct
+    # calls below aren't dropped by the L1 guard.
+    mw._phase_states["t1"] = {}
     # Manually queue two identical hints to simulate duplicates.
     mw._queue_assessment(rt, "[PROGRESS HINT] same hint text")
     mw._queue_assessment(rt, "[PROGRESS HINT] same hint text")
@@ -989,7 +1069,7 @@ def test_from_config_default_exempt_tools_round_trip():
 
     cfg = ToolProgressConfig(enabled=True)
     mw = ToolProgressMiddleware.from_config(cfg)
-    assert mw._exempt_tools == {"ask_clarification", "write_todos", "present_files"}
+    assert mw._exempt_tools == {"ask_clarification", "write_todos", "present_files", "task"}
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1096,29 @@ def test_wrap_tool_call_malformed_meta_passthrough():
 
     assert result is bad_msg
     assert mw._phase_states.get("t1", {}).get("web_search") is None
+
+
+def test_missing_meta_on_non_exempt_tool_emits_warning(caplog):
+    """When deerflow_tool_meta is completely absent for a non-exempt tool,
+    the middleware must emit a warning pointing to the likely ordering misconfiguration.
+    """
+    import logging
+
+    mw = _make_mw()
+    rt = _make_runtime()
+    req = _make_tool_request(runtime=rt)
+    no_meta_msg = ToolMessage(
+        content="some content",
+        tool_call_id="tc-web_search",
+        name="web_search",
+        status="success",
+        additional_kwargs={},  # no TOOL_META_KEY at all
+    )
+
+    with caplog.at_level(logging.WARNING, logger="deerflow.agents.middlewares.tool_progress_middleware"):
+        mw.wrap_tool_call(req, lambda _r: no_meta_msg)
+
+    assert any("deerflow_tool_meta missing" in r.message for r in caplog.records), "Expected a warning about missing meta for non-exempt tool"
 
 
 # ---------------------------------------------------------------------------

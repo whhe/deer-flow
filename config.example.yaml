@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 15
+config_version: 16
 
 # ============================================================================
 # Logging
@@ -833,6 +833,7 @@ loop_detection:
 #     - ask_clarification
 #     - write_todos
 #     - present_files
+#     - task
 
 # ============================================================================
 # Provider Safety Termination Configuration

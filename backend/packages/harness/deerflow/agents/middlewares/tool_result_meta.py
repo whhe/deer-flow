@@ -8,6 +8,7 @@ Every tool result that passes through ToolErrorHandlingMiddleware gets a
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,15 +18,23 @@ from langgraph.types import Command
 TOOL_META_KEY = "deerflow_tool_meta"
 
 _ERROR_PREFIX = "Error:"
-_PARTIAL_MARKERS = ("partial results", "limited results", "truncated", "results may be incomplete")
-_MIN_SUBSTANTIAL_CONTENT = 80
+_PARTIAL_MARKERS = (
+    "partial results",
+    "limited results",
+    "truncated",
+    "results may be incomplete",
+    # Tools that return status="success" with a no-results body (instead of status="error")
+    # must still be caught by stagnation detection so the model is prompted to try a different query.
+    "no results found",
+    "no content found",
+    "no images found",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResultMeta:
     status: Literal["success", "error", "partial_success"]
     error_type: str | None
-    retryable: bool
     recoverable_by_model: bool
     recommended_next_action: Literal["continue", "rewrite_query", "try_alternative", "summarize", "stop"]
     source: Literal["exception", "tool_return", "content_analysis", "progress_middleware"]
@@ -34,45 +43,49 @@ class ToolResultMeta:
 _ERROR_RULES: list[tuple[list[str], dict[str, object]]] = [
     (
         ["401", "403", "unauthorized", "authentication", "invalid api key"],
-        {"error_type": "auth", "retryable": False, "recoverable_by_model": False, "recommended_next_action": "stop"},
+        {"error_type": "auth", "recoverable_by_model": False, "recommended_next_action": "stop"},
     ),
     (
         ["rate limit", "rate limited", "rate_limit"],
-        {"error_type": "rate_limited", "retryable": True, "recoverable_by_model": False, "recommended_next_action": "summarize"},
+        {"error_type": "rate_limited", "recoverable_by_model": False, "recommended_next_action": "summarize"},
     ),
     (
         ["timeout", "timed out", "connection", "network error", "temporarily unavailable"],
-        {"error_type": "transient", "retryable": True, "recoverable_by_model": False, "recommended_next_action": "try_alternative"},
+        {"error_type": "transient", "recoverable_by_model": False, "recommended_next_action": "try_alternative"},
     ),
     (
         ["not configured", "not installed", "missing required", "disabled", "no api key"],
-        {"error_type": "config", "retryable": False, "recoverable_by_model": False, "recommended_next_action": "stop"},
+        {"error_type": "config", "recoverable_by_model": False, "recommended_next_action": "stop"},
     ),
     (
         ["permission denied", "access denied", "path traversal", "forbidden"],
-        {"error_type": "permission", "retryable": False, "recoverable_by_model": True, "recommended_next_action": "try_alternative"},
+        {"error_type": "permission", "recoverable_by_model": True, "recommended_next_action": "try_alternative"},
     ),
     (
         ["no results found", "no content found", "no images found", "no results"],
-        {"error_type": "no_results", "retryable": False, "recoverable_by_model": True, "recommended_next_action": "rewrite_query"},
+        {"error_type": "no_results", "recoverable_by_model": True, "recommended_next_action": "rewrite_query"},
     ),
     (
         ["not found", "no such file", "does not exist", "404"],
-        {"error_type": "not_found", "retryable": False, "recoverable_by_model": True, "recommended_next_action": "rewrite_query"},
+        {"error_type": "not_found", "recoverable_by_model": True, "recommended_next_action": "rewrite_query"},
     ),
     (
         ["unexpected error", "internal error", "500"],
-        {"error_type": "internal", "retryable": False, "recoverable_by_model": False, "recommended_next_action": "stop"},
+        {"error_type": "internal", "recoverable_by_model": False, "recommended_next_action": "stop"},
     ),
 ]
 
 _UNKNOWN_ERROR: dict[str, object] = {
     "error_type": "unknown",
-    "retryable": False,
     "recoverable_by_model": True,
     "recommended_next_action": "try_alternative",
 }
 
+# Pre-compiled at module load from _ERROR_RULES. Anchoring bare numeric codes (401, 403, 404,
+# 500) to word boundaries prevents substring hits on unrelated numbers like "took 500ms".
+# Computed here (after _ERROR_RULES) so the set is authoritative and thread-safe — no lazy
+# writes on the hot classification path.
+_NUMERIC_KW_RE: dict[str, re.Pattern[str]] = {kw: re.compile(rf"\b{kw}\b") for rule_keywords, _ in _ERROR_RULES for kw in rule_keywords if kw.isdigit()}
 
 _SEMANTIC_ZERO_ERROR_STRINGS: frozenset[str] = frozenset({"none", "null", "false", "no", "ok", "success", "n/a", ""})
 
@@ -95,22 +108,31 @@ def _extract_json_error_text(content: str) -> str | None:
         return None
     if isinstance(error, str) and error.lower().strip() in _SEMANTIC_ZERO_ERROR_STRINGS:
         return None
-    return str(error)
+    # Serialize non-string values to JSON so _classify_error_text sees a predictable
+    # format (e.g. {"error": 404} → "404", {"error": [...]} → "[...]") instead of
+    # Python repr which can spuriously match keyword rules like "missing required".
+    return error if isinstance(error, str) else json.dumps(error)
+
+
+def _match_keyword(kw: str, lower: str) -> bool:
+    """Match a keyword against lowercased text, using word boundaries for numeric codes."""
+    if kw.isdigit():
+        return bool(_NUMERIC_KW_RE[kw].search(lower))
+    return kw in lower
 
 
 def _classify_error_text(text: str) -> dict[str, object]:
     lower = text.lower()
     for keywords, attrs in _ERROR_RULES:
-        if any(kw in lower for kw in keywords):
+        if any(_match_keyword(kw, lower) for kw in keywords):
             return {**attrs}
     return {**_UNKNOWN_ERROR}
 
 
-def _make_meta(*, status: str, source: str, error_type: str | None = None, retryable: bool = False, recoverable_by_model: bool = True, recommended_next_action: str = "continue") -> dict[str, object]:
+def _make_meta(*, status: str, source: str, error_type: str | None = None, recoverable_by_model: bool = True, recommended_next_action: str = "continue") -> dict[str, object]:
     return {
         "status": status,
         "error_type": error_type,
-        "retryable": retryable,
         "recoverable_by_model": recoverable_by_model,
         "recommended_next_action": recommended_next_action,
         "source": source,
@@ -146,7 +168,18 @@ def normalize_tool_message(msg: ToolMessage) -> ToolMessage:
     # keywords that appear incidentally in other JSON fields (e.g. "query").
     if msg.status == "error" and not content.startswith(_ERROR_PREFIX):
         json_error = _extract_json_error_text(content)
-        attrs = _classify_error_text(json_error if json_error is not None else content)
+        if json_error is not None:
+            attrs = _classify_error_text(json_error)
+        else:
+            # Determine whether content is a JSON object that simply has no 'error' key.
+            # If so, do NOT classify from the raw JSON string — incidental field values
+            # (e.g. {"user_id": 401}) would spuriously match keyword rules and hard-block
+            # the tool.  Classify raw text only when the content is not valid JSON.
+            try:
+                is_json_dict = isinstance(json.loads(content), dict)
+            except (json.JSONDecodeError, ValueError):
+                is_json_dict = False
+            attrs = {**_UNKNOWN_ERROR} if is_json_dict else _classify_error_text(content)
         meta = _make_meta(status="error", source="tool_return", **attrs)
     elif content.startswith(_ERROR_PREFIX):
         attrs = _classify_error_text(content[len(_ERROR_PREFIX) :])
@@ -154,7 +187,7 @@ def normalize_tool_message(msg: ToolMessage) -> ToolMessage:
     elif (json_error := _extract_json_error_text(content)) is not None:
         attrs = _classify_error_text(json_error)
         meta = _make_meta(status="error", source="tool_return", **attrs)
-    elif any(m in content.lower() for m in _PARTIAL_MARKERS) or (0 < len(content) < _MIN_SUBSTANTIAL_CONTENT):
+    elif any(m in content.lower() for m in _PARTIAL_MARKERS):
         meta = _make_meta(
             status="partial_success",
             source="content_analysis",

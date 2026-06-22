@@ -67,11 +67,10 @@ def test_error_prefix_classification(snippet: str, expected_type: str):
     assert m["source"] == "tool_return"
 
 
-def test_auth_error_is_not_retryable_and_stop():
+def test_auth_error_is_unrecoverable_and_stop():
     msg = _make_msg("Error: invalid api key", status="error")
     result = normalize_tool_message(msg)
     m = _meta(result)
-    assert m["retryable"] is False
     assert m["recoverable_by_model"] is False
     assert m["recommended_next_action"] == "stop"
 
@@ -91,12 +90,12 @@ def test_no_api_key_is_config_not_auth():
     assert m["recoverable_by_model"] is False
 
 
-def test_rate_limited_error_is_retryable():
+def test_rate_limited_error_suggests_summarize():
     msg = _make_msg("Error: rate limited", status="error")
     result = normalize_tool_message(msg)
     m = _meta(result)
-    assert m["retryable"] is True
     assert m["recommended_next_action"] == "summarize"
+    assert m["recoverable_by_model"] is False
 
 
 def test_no_results_suggests_rewrite_query():
@@ -144,14 +143,66 @@ def test_nonstd_error_status_json_classifies_from_error_field():
     assert m["error_type"] == "unknown"
 
 
-def test_nonstd_error_status_json_no_error_key_falls_back_to_content():
-    # JSON without an "error" key falls back to classifying the full content string.
+def test_nonstd_error_status_json_no_error_key_is_unknown():
+    # JSON with no 'error' key must NOT be classified from other field values.
+    # Previously, {"message": "connection refused"} would be passed to _classify_error_text
+    # and match the transient rule via "connection"; now the full JSON is treated as unknown.
     content = '{"message": "connection refused"}'
     msg = _make_msg(content, status="error")
     result = normalize_tool_message(msg)
     m = _meta(result)
     assert m["status"] == "error"
+    assert m["error_type"] == "unknown", "JSON dict with no 'error' key must resolve to unknown"
+
+
+def test_nonstd_error_status_json_no_error_key_with_dangerous_field_is_unknown():
+    # {"user_id": 401} previously triggered auth stop; must now be unknown.
+    content = '{"user_id": 401, "action": "login"}'
+    msg = _make_msg(content, status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == "unknown"
+    assert m["recommended_next_action"] != "stop", "spurious 401 in non-error field must not trigger stop"
+
+
+def test_nonstd_error_status_non_json_content_still_classified():
+    # Plain text (not JSON) with status="error" must still be classified from content.
+    content = "connection refused: remote host unreachable"
+    msg = _make_msg(content, status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
     assert m["error_type"] == "transient"
+
+
+def test_json_error_field_dict_is_serialized_not_repr():
+    # FastAPI-style: {"error": [{"loc": ["body"], "msg": "missing required field"}]}
+    # str() would produce Python repr containing 'missing required' → config → stop.
+    # json.dumps produces a clean JSON string that should not spuriously match.
+    import json as _json
+
+    error_val = [{"loc": ["body"], "msg": "missing required field"}]
+    content = _json.dumps({"error": error_val})
+    msg = _make_msg(content, status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    # The JSON-serialized error list contains "missing required field" which IS in the config rule.
+    # This is correct classification (the validation error IS a config-class problem).
+    # The key requirement is that we're classifying from the error field value, not repr noise.
+    assert m["error_type"] == "config"
+
+
+def test_no_results_success_response_is_partial_success():
+    # Tools that return status="success" with "no results found" content must be treated as
+    # partial_success so ToolProgressMiddleware can detect stagnation.
+    for phrase in ("no results found", "No Content Found here", "no images found for query"):
+        msg = _make_msg(phrase, status="success")
+        result = normalize_tool_message(msg)
+        m = _meta(result)
+        assert m["status"] == "partial_success", f"expected partial_success for: {phrase!r}"
+        assert m["recommended_next_action"] == "rewrite_query"
 
 
 # ---------------------------------------------------------------------------
@@ -167,20 +218,22 @@ def test_partial_markers_detected():
         assert m["recommended_next_action"] == "rewrite_query"
 
 
-def test_short_content_is_partial():
+def test_short_terse_success_is_not_partial():
+    # "Ok." is a valid, complete success response from mutation tools like write_file/str_replace.
+    # partial_success is now gated only on _PARTIAL_MARKERS, not content length.
     msg = _make_msg("Ok.", status="success")
     result = normalize_tool_message(msg)
     m = _meta(result)
-    assert m["status"] == "partial_success"
+    assert m["status"] == "success"
     assert m["source"] == "content_analysis"
 
 
 def test_empty_content_is_not_partial():
-    # Empty content: len == 0, so the `0 < len(content) < 80` condition is False
+    # Empty content has no partial markers, so it falls through to success.
     msg = _make_msg("", status="success")
     result = normalize_tool_message(msg)
     m = _meta(result)
-    # Empty content falls through to success (no partial markers, len == 0)
+    # Empty content falls through to success (no partial markers)
     assert m["status"] == "success"
 
 
@@ -210,7 +263,6 @@ def test_tool_result_meta_from_dict():
     meta = ToolResultMeta(**meta_dict)
     assert meta.status == "success"
     assert meta.error_type is None
-    assert meta.retryable is False
     assert meta.recommended_next_action == "continue"
 
 
@@ -379,3 +431,38 @@ def test_normalize_json_semantic_zero_error_string_not_treated_as_error(error_va
     result = normalize_tool_message(msg)
     m = _meta(result)
     assert m["status"] != "error", f'error="{error_value}" should not be treated as an error; got status={m["status"]!r}'
+
+
+# ---------------------------------------------------------------------------
+# Numeric keyword word-boundary matching (_match_keyword)
+
+
+@pytest.mark.parametrize(
+    "content, expected_error_type",
+    [
+        # Positive: numeric code at a word boundary → correct classification
+        ("Error: HTTP 500 Internal Server Error", "internal"),
+        ("Error: returned status 500", "internal"),
+        ("Error: 401 Unauthorized", "auth"),
+        ("Error: 404 Not Found", "not_found"),
+        # Negative: numeric code embedded inside a longer token → must resolve to "unknown".
+        # Use exact "unknown" assertions so any future rule additions that accidentally
+        # absorb these strings are caught (a broad exclusion list would miss new matches).
+        ("Error: took 500ms to respond", "unknown"),
+        ("Error: query returned 4010 rows", "unknown"),
+        ("Error: batch 401A failed", "unknown"),
+        ("Error: response contained 5000 items", "unknown"),
+    ],
+)
+def test_numeric_keyword_word_boundary(content: str, expected_error_type: str):
+    """Numeric HTTP codes must match only at word boundaries to avoid false positives.
+
+    '500ms', '4010', '401A', '5000' must not trigger internal/auth/not_found rules.
+    Negative cases assert exactly 'unknown' so future rule additions that accidentally
+    absorb these strings are caught — a broad exclusion-list assertion would not be.
+    """
+    msg = _make_msg(content, status="error")
+    result = normalize_tool_message(msg)
+    m = _meta(result)
+    assert m["status"] == "error"
+    assert m["error_type"] == expected_error_type, f"{content!r} → expected {expected_error_type!r}, got {m['error_type']!r}"

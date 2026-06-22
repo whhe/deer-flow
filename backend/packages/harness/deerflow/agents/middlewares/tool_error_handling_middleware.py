@@ -199,12 +199,23 @@ def _build_runtime_middlewares(
     # on every result before ToolProgressMiddleware reads it in _update_state_from_result.
     # Framework rule: first in list = outermost (types.py: "compose with first in list as outermost layer").
     tool_progress_config = app_config.tool_progress
+    _ToolProgressMiddleware = None
     if tool_progress_config.enabled:
-        from deerflow.agents.middlewares.tool_progress_middleware import ToolProgressMiddleware
+        from deerflow.agents.middlewares.tool_progress_middleware import ToolProgressMiddleware as _ToolProgressMiddleware
 
-        middlewares.append(ToolProgressMiddleware.from_config(tool_progress_config))
+        middlewares.append(_ToolProgressMiddleware.from_config(tool_progress_config))
 
     middlewares.append(ToolErrorHandlingMiddleware())
+
+    # Guard: ToolProgressMiddleware (outer) must appear before ToolErrorHandlingMiddleware (inner)
+    # so that its wrap_tool_call chain encloses the stamping step.  Fail loudly at build time
+    # rather than silently no-oping at runtime if a future insertion reverses the order.
+    # Uses isinstance (not type().__name__) so subclasses and renames are covered.
+    if _ToolProgressMiddleware is not None:
+        _progress_idx = next((i for i, m in enumerate(middlewares) if isinstance(m, _ToolProgressMiddleware)), None)
+        _error_idx = next((i for i, m in enumerate(middlewares) if isinstance(m, ToolErrorHandlingMiddleware)), None)
+        if _progress_idx is not None and _error_idx is not None and _progress_idx > _error_idx:
+            raise RuntimeError(f"ToolProgressMiddleware must be outer (index {_progress_idx}) of ToolErrorHandlingMiddleware (index {_error_idx}) — check middleware append order")
 
     return middlewares
 

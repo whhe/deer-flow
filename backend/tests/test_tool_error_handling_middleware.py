@@ -185,6 +185,40 @@ def test_tool_progress_middleware_is_outer_relative_to_error_handling(monkeypatc
     assert progress_idx < error_idx, f"ToolProgressMiddleware (index {progress_idx}) must be outer (lower index) than ToolErrorHandlingMiddleware (index {error_idx}); order: {[type(m).__name__ for m in middlewares]}"
 
 
+def test_middleware_ordering_guard_raises_when_progress_is_inner(monkeypatch: pytest.MonkeyPatch):
+    """_build_runtime_middlewares must raise RuntimeError when ToolProgressMiddleware ends up
+    at a higher index than ToolErrorHandlingMiddleware.
+
+    We trigger the wrong-order condition by patching SandboxAuditMiddleware to be an actual
+    ToolErrorHandlingMiddleware instance, which appears BEFORE ToolProgressMiddleware in the
+    list. The guard's isinstance() check finds it first, making error_idx < progress_idx.
+    """
+    from deerflow.agents.middlewares.tool_error_handling_middleware import (
+        ToolErrorHandlingMiddleware,
+        build_lead_runtime_middlewares,
+    )
+    from deerflow.config.tool_progress_config import ToolProgressConfig
+
+    _stub_runtime_middleware_imports(monkeypatch)
+    # Override the SandboxAuditMiddleware stub with a real ToolErrorHandlingMiddleware so it
+    # becomes the FIRST ToolErrorHandlingMiddleware in the list, appearing before
+    # ToolProgressMiddleware and triggering the ordering guard.
+    monkeypatch.setitem(
+        sys.modules,
+        "deerflow.agents.middlewares.sandbox_audit_middleware",
+        _module(
+            "deerflow.agents.middlewares.sandbox_audit_middleware",
+            SandboxAuditMiddleware=ToolErrorHandlingMiddleware,
+        ),
+    )
+
+    app_config = _make_app_config()
+    app_config = app_config.model_copy(update={"tool_progress": ToolProgressConfig(enabled=True)})
+
+    with pytest.raises(RuntimeError, match="ToolProgressMiddleware must be outer"):
+        build_lead_runtime_middlewares(app_config=app_config, lazy_init=False)
+
+
 def test_wrap_tool_call_passthrough_on_success():
     middleware = ToolErrorHandlingMiddleware()
     req = _request()
