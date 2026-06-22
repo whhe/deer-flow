@@ -23,6 +23,27 @@ State machine transitions per (thread_id, tool_name):
       these by retrying the same tool, so hard-blocking conserves API calls.
   - recoverable_by_model=False, action=stop (auth, config, internal):
       Immediately BLOCKED on the first occurrence — no retry can help.
+
+Division of labor with LoopDetectionMiddleware (middleware position 19):
+  ToolProgressMiddleware (position 8) is a result-quality guard — it fires
+  after a tool executes, inspects what came back, and blocks *specific tools*
+  that have stopped producing new information.
+
+  LoopDetectionMiddleware is a call-pattern guard — it fires after the model
+  responds (before tools execute), inspects the tool_calls signature in the
+  AIMessage, and forces the *whole turn* to stop when the model keeps issuing
+  the same calls regardless of results.
+
+  They are complementary, not competing:
+  - ToolProgressMiddleware is fine-grained (per-tool BLOCK, other tools normal).
+  - LoopDetectionMiddleware is coarse-grained (strips all tool_calls, ends turn).
+  - Both can inject HumanMessage hints in the same model call without conflict;
+    the model sees both sets of hints and can reason about them.
+  - If LoopDetectionMiddleware hard-stops (strips tool_calls), no wrap_tool_call
+    is issued so ToolProgressMiddleware never fires — there is no double-stop.
+  - If ToolProgressMiddleware BLOCKs a tool (returns an error ToolMessage),
+    the model still makes a tool call that LoopDetectionMiddleware tracks; both
+    continue to operate on their own independent state.
 """
 
 from __future__ import annotations
@@ -192,6 +213,11 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         self._exempt_tools: set[str] = exempt_tools if exempt_tools is not None else {"ask_clarification", "write_todos", "present_files", "task"}
         self._max_tracked_threads = max_tracked_threads
 
+        # threading.Lock (not asyncio.Lock): critical sections are short in-memory dict
+        # ops with no I/O, so event-loop stall risk is negligible.  asyncio.Lock would
+        # not protect the sync wrap_tool_call path used by subagent executor thread
+        # pools — two separate locks would be required instead.  This matches the
+        # existing LoopDetectionMiddleware pattern; see module docstring for details.
         self._lock = threading.Lock()
         # LRU-evicting store: thread_id → {tool_name → ToolPhaseState}
         self._phase_states: OrderedDict[str, dict[str, ToolPhaseState]] = OrderedDict()

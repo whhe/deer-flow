@@ -1356,3 +1356,82 @@ def test_log_hint_injection_emits_debug(caplog):
     debug_records = [r for r in caplog.records if r.levelname == "DEBUG" and "injecting" in r.message]
     assert len(debug_records) == 1
     assert "injecting 1 hint" in debug_records[0].message
+
+
+# ---------------------------------------------------------------------------
+# Coexistence: ToolProgressMiddleware + LoopDetectionMiddleware
+
+
+def test_tool_progress_and_loop_detection_coexist_without_interfering():
+    """ToolProgressMiddleware and LoopDetectionMiddleware operate on separate signals
+    and must not interfere when both are active simultaneously.
+
+    ToolProgressMiddleware (position 8): result-quality guard, fires after tool execution,
+    tracks per-(thread, tool) stagnation, BLOCKs specific tools.
+    LoopDetectionMiddleware (position 19): call-pattern guard, fires after model response,
+    tracks repeated tool_call signatures, hard-stops the whole turn.
+
+    Both can inject HumanMessage hints in the same model call; neither reads or writes
+    the other's internal state.
+    """
+    from langchain_core.messages import AIMessage
+
+    from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+
+    tp_mw = _make_mw(stagnation_threshold=2, warn_escalation_count=5, inject_assessment=True)
+    ld_mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=10)
+
+    tp_rt = _make_runtime(thread_id="t1", run_id="r1")
+    # LoopDetection uses its own runtime/thread context
+    ld_rt = _make_runtime(thread_id="ld-thread", run_id="ld-run")
+    req = _make_tool_request(runtime=tp_rt)
+
+    # --- Drive ToolProgress to WARNED via repeated error results (result-quality signal) ---
+    error_msg = _make_error_message()  # recoverable error, stagnation_threshold=2
+    tp_mw.wrap_tool_call(req, lambda _: error_msg)
+    tp_mw.wrap_tool_call(req, lambda _: error_msg)
+
+    assert tp_mw._phase_states["t1"]["web_search"].phase == "warned"
+    tp_hints = list(tp_mw._pending.get(("t1", "r1"), []))
+    assert len(tp_hints) == 1, "ToolProgress must queue exactly one hint at stagnation"
+
+    # --- Drive LoopDetection to WARNED via repeated AIMessage tool_calls (call-pattern signal) ---
+    repeated_call = [{"name": "web_search", "args": {"query": "q"}, "id": "tc-1"}]
+    ld_state = {"messages": [AIMessage(content="", tool_calls=repeated_call)]}
+    for _ in range(3):  # warn_threshold=3
+        ld_mw._apply(ld_state, ld_rt)
+
+    ld_warnings_live = ld_mw._pending_warnings.get(("ld-thread", "ld-run"), [])
+    assert len(ld_warnings_live) >= 1, "LoopDetection must queue at least one warning"
+    # Snapshot a copy so the final cross-contamination check compares a frozen
+    # baseline to the live state — a same-object comparison would always be True.
+    ld_warnings_snapshot = list(ld_warnings_live)
+
+    # --- Verify no cross-contamination between the two middlewares ---
+    # ToolProgress internal state is not visible to LoopDetection
+    assert not hasattr(ld_mw, "_phase_states"), "LoopDetection must not have _phase_states"
+    # LoopDetection internal state is not visible to ToolProgress
+    assert not hasattr(tp_mw, "_history"), "ToolProgress must not have _history"
+    # LoopDetection does not track ToolProgress's thread id
+    assert "t1" not in ld_mw._history, "LoopDetection must not have entries for ToolProgress's thread"
+    # ToolProgress does not have loop detection warnings
+    assert not any("LOOP" in h for h in tp_hints), "ToolProgress hints must not contain loop-detection text"
+
+    # --- ToolProgress hint injection is independent of LoopDetection ---
+    model_req = _make_model_request([], tp_rt)
+    captured: list = []
+
+    def capture_handler(r):
+        captured.extend(r.messages)
+        return MagicMock()
+
+    tp_mw.wrap_model_call(model_req, capture_handler)
+    injected = [m for m in captured if isinstance(m, HumanMessage)]
+    assert len(injected) == 1, "ToolProgress must inject exactly one hint message"
+    assert "PROGRESS HINT" in injected[0].content
+
+    # After ToolProgress drains, its queue is empty; LoopDetection warnings unchanged.
+    # Compare live state against the snapshot taken before the model call — a same-object
+    # comparison would be trivially True and would not detect accidental modifications.
+    assert tp_mw._pending.get(("t1", "r1"), []) == []
+    assert ld_mw._pending_warnings.get(("ld-thread", "ld-run"), []) == ld_warnings_snapshot

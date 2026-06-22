@@ -160,6 +160,9 @@ def normalize_tool_message(msg: ToolMessage) -> ToolMessage:
         return msg
 
     content = msg.content if isinstance(msg.content, str) else ""
+    # Pre-compute once; reused by the partial-success marker check below to avoid calling
+    # content.lower() once per _PARTIAL_MARKERS entry inside the generator.
+    content_lower = content.lower()
 
     # Non-standard error: tool returned status="error" without the "Error:" prefix convention.
     # (Actual exceptions from ToolErrorHandlingMiddleware are pre-stamped by stamp_exception_meta
@@ -187,7 +190,7 @@ def normalize_tool_message(msg: ToolMessage) -> ToolMessage:
     elif (json_error := _extract_json_error_text(content)) is not None:
         attrs = _classify_error_text(json_error)
         meta = _make_meta(status="error", source="tool_return", **attrs)
-    elif any(m in content.lower() for m in _PARTIAL_MARKERS):
+    elif any(m in content_lower for m in _PARTIAL_MARKERS):
         meta = _make_meta(
             status="partial_success",
             source="content_analysis",
