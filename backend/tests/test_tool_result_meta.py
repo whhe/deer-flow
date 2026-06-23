@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
@@ -425,8 +427,12 @@ def test_normalize_json_semantic_zero_error_string_not_treated_as_error(error_va
     Tools sometimes return {"error": "none", "results": [...]} on success.
     The string "none" is truthy in Python, so without this guard the message
     would have been classified as error (unknown), inflating stagnation counters.
+
+    Note: the empty-string case ("") is handled by the falsy guard (`if not error: return None`)
+    in _extract_json_error_text rather than by _SEMANTIC_ZERO_ERROR_STRINGS.  Both paths produce
+    the same outcome (no misclassification), but the mechanism differs from the other cases here.
     """
-    content = f'{{"error": {error_value!r}, "results": ["item1", "item2", "item3"]}}'
+    content = json.dumps({"error": error_value, "results": ["item1", "item2", "item3"]})
     msg = _make_msg(content, status="success")
     result = normalize_tool_message(msg)
     m = _meta(result)

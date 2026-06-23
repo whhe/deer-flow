@@ -442,17 +442,16 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
                 if key[0] == thread_id and key[1] != current_run:
                     del self._pending[key]
 
-    def _reset_blocked_states(self, runtime: Runtime) -> None:
-        """Reset BLOCKED and WARNED tool states for the thread at the start of a new run.
+    def _reset_run_states(self, runtime: Runtime) -> None:
+        """Reset all per-run tool state for the thread at the start of a new agent run.
 
-        Both BLOCKED and WARNED are scoped to a single agent run:
-        - A BLOCKED tool must not stay blocked in the next run where the model has no memory
-          of the WARN hint that preceded it (auth/config errors re-block immediately anyway).
-        - A WARNED tool with accumulated consecutive_problems must not carry that count into
-          the next run; the model has not seen the warning context and would be hard-blocked
-          within a few calls without ever receiving a hint in the current session.
-        Jaccard recent_word_sets is also cleared so stale content windows from a prior run
-        do not cause false near-duplicate detections on the first success of the new run.
+        Every tool's consecutive_problems counter and recent_word_sets Jaccard window are
+        cleared unconditionally so state from a previous run never bleeds into the next:
+        - BLOCKED/WARNED tools are reset to ACTIVE (they re-block immediately if the root
+          cause persists, and the model has no memory of the prior-run hint).
+        - ACTIVE tools with non-zero consecutive_problems or non-empty recent_word_sets from
+          the previous run are also cleared so a single first-call problem in the new run
+          cannot falsely trip WARNED against stale context from a run the model no longer sees.
         """
         thread_id = self._thread_id(runtime)
         with self._lock:
@@ -460,14 +459,13 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
             if thread_tools is None:
                 return
             for tool_name, tool_state in list(thread_tools.items()):
-                if tool_state.phase in ("blocked", "warned"):
-                    thread_tools[tool_name] = replace(
-                        tool_state,
-                        phase="active",
-                        consecutive_problems=0,
-                        block_reason=None,
-                        recent_word_sets=(),
-                    )
+                thread_tools[tool_name] = replace(
+                    tool_state,
+                    phase="active",
+                    consecutive_problems=0,
+                    block_reason=None,
+                    recent_word_sets=(),
+                )
 
     # ------------------------------------------------------------------
     # wrap_tool_call
@@ -559,11 +557,11 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
     @override
     def before_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
         self._clear_stale_pending(runtime)
-        self._reset_blocked_states(runtime)
+        self._reset_run_states(runtime)
         return None
 
     @override
     async def abefore_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
         self._clear_stale_pending(runtime)
-        self._reset_blocked_states(runtime)
+        self._reset_run_states(runtime)
         return None

@@ -615,7 +615,7 @@ def test_before_agent_resets_blocked_states_for_new_run():
     state_mock = MagicMock()
     mw.before_agent(state_mock, rt_run2)
 
-    # _reset_blocked_states always replaces the entry in-place; it is never None.
+    # _reset_run_states always replaces the entry in-place; it is never None.
     tool_state = mw._phase_states.get("t1", {}).get("web_search")
     assert tool_state is not None
     assert tool_state.phase == "active"
@@ -651,6 +651,48 @@ def test_before_agent_resets_warned_states_for_new_run():
     assert tool_state.phase == "active"
     assert tool_state.consecutive_problems == 0
     assert tool_state.recent_word_sets == ()
+
+
+def test_before_agent_resets_active_state_consecutive_problems_and_word_sets():
+    """ACTIVE tools with sub-threshold problems must also be cleaned at run boundaries.
+
+    An ACTIVE tool (phase never left 'active') can exit a run with non-zero
+    consecutive_problems and non-empty recent_word_sets.  If _reset_run_states only
+    touched BLOCKED/WARNED tools, the counter from R1 would bleed into R2: a single
+    problem on R2's first call could then trip WARNED against stale R1 context that
+    the model has never seen.
+    """
+    # stagnation_threshold=3 so two errors keep the tool ACTIVE.
+    mw = _make_mw(stagnation_threshold=3, warn_escalation_count=5)
+    rt_run1 = _make_runtime(thread_id="t1", run_id="run-1")
+    rt_run2 = _make_runtime(thread_id="t1", run_id="run-2")
+    req = _make_tool_request(runtime=rt_run1)
+
+    # Two successes → recent_word_sets grows.
+    success_a = _make_tool_message("alpha beta gamma delta epsilon zeta eta theta iota kappa")
+    success_b = _make_tool_message("lambda mu nu xi omicron pi rho sigma tau upsilon phi chi")
+    mw.wrap_tool_call(req, lambda _r: success_a)
+    mw.wrap_tool_call(req, lambda _r: success_b)
+
+    # One recoverable error → consecutive_problems=1, phase stays ACTIVE.
+    error_msg = _make_error_message()
+    mw.wrap_tool_call(req, lambda _r: error_msg)
+
+    state_r1 = mw._phase_states.get("t1", {}).get("web_search")
+    assert state_r1 is not None
+    assert state_r1.phase == "active"
+    assert state_r1.consecutive_problems == 1
+    assert len(state_r1.recent_word_sets) > 0
+
+    # Start of run 2: all per-run state must be cleared.
+    state_mock = MagicMock()
+    mw.before_agent(state_mock, rt_run2)
+
+    state_r2 = mw._phase_states.get("t1", {}).get("web_search")
+    assert state_r2 is not None
+    assert state_r2.phase == "active"
+    assert state_r2.consecutive_problems == 0
+    assert state_r2.recent_word_sets == ()
 
 
 # ---------------------------------------------------------------------------
