@@ -24,8 +24,8 @@ State machine transitions per (thread_id, tool_name):
   - recoverable_by_model=False, action=stop (auth, config, internal):
       Immediately BLOCKED on the first occurrence — no retry can help.
 
-Division of labor with LoopDetectionMiddleware (middleware position 19):
-  ToolProgressMiddleware (position 8) is a result-quality guard — it fires
+Division of labor with LoopDetectionMiddleware (middleware position 23):
+  ToolProgressMiddleware (position 10) is a result-quality guard — it fires
   after a tool executes, inspects what came back, and blocks *specific tools*
   that have stopped producing new information.
 
