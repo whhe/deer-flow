@@ -116,6 +116,8 @@ export const enUS: Translations = {
       "You already have text in the input. Choose how to send it.",
     followupConfirmAppend: "Append & send",
     followupConfirmReplace: "Replace & send",
+    suggestionPlaceholderRequired:
+      "Replace the suggestion placeholder before sending.",
     suggestions: [
       {
         suggestion: "Write",
@@ -565,6 +567,10 @@ export const enUS: Translations = {
     pleaseWait: "Please wait...",
     signIn: "Sign In",
     createAccount: "Create Account",
+    createAdminAccount: "Create admin account",
+    adminSetupRequiredTitle: "Administrator setup is required",
+    adminSetupRequiredDescription:
+      "DeerFlow needs an administrator account before new regular accounts can be created.",
     orContinueWith: "Or continue with",
     ssoHint:
       "If your account uses single sign-on, sign in with the option below instead.",

@@ -145,27 +145,31 @@ def _build_runtime_middlewares(
     from deerflow.agents.middlewares.tool_output_budget_middleware import ToolOutputBudgetMiddleware
     from deerflow.sandbox.middleware import SandboxMiddleware
 
+    # Layer 1 — outermost wrap_model_call wrappers (listed outer→inner).
     # InputSanitizationMiddleware is first so it becomes the outermost
-    # wrap_model_call wrapper — sanitised messages are what every inner
-    # middleware (including LLMErrorHandlingMiddleware retries) sees.
-    middlewares: list[AgentMiddleware] = [
+    # wrapper — sanitised messages are what every inner middleware sees.
+    outer_wrappers: list[AgentMiddleware] = [
         InputSanitizationMiddleware(),
         ToolOutputBudgetMiddleware.from_app_config(app_config),
-        ThreadDataMiddleware(lazy_init=lazy_init),
-        SandboxMiddleware(lazy_init=lazy_init),
     ]
 
+    # Layer 2 — before_agent hooks that read/annotate thread-scoped data.
+    thread_hooks: list[AgentMiddleware] = [
+        ThreadDataMiddleware(lazy_init=lazy_init),
+    ]
     if include_uploads:
         from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
 
-        middlewares.insert(2, UploadsMiddleware())
+        thread_hooks.append(UploadsMiddleware())
+    thread_hooks.append(SandboxMiddleware(lazy_init=lazy_init))
 
+    # Layer 3 — post-processing append-only middlewares.
+    tail: list[AgentMiddleware] = []
     if include_dangling_tool_call_patch:
         from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 
-        middlewares.append(DanglingToolCallMiddleware())
-
-    middlewares.append(LLMErrorHandlingMiddleware(app_config=app_config))
+        tail.append(DanglingToolCallMiddleware())
+    tail.append(LLMErrorHandlingMiddleware(app_config=app_config))
 
     # Guardrail middleware (if configured)
     guardrails_config = app_config.guardrails
@@ -188,11 +192,11 @@ def _build_runtime_middlewares(
             except (ValueError, TypeError):
                 pass
         provider = provider_cls(**provider_kwargs)
-        middlewares.append(GuardrailMiddleware(provider, fail_closed=guardrails_config.fail_closed, passport=guardrails_config.passport))
+        tail.append(GuardrailMiddleware(provider, fail_closed=guardrails_config.fail_closed, passport=guardrails_config.passport))
 
     from deerflow.agents.middlewares.sandbox_audit_middleware import SandboxAuditMiddleware
 
-    middlewares.append(SandboxAuditMiddleware())
+    tail.append(SandboxAuditMiddleware())
 
     # ToolProgressMiddleware must be outer (lower index) so its wrap_tool_call handler
     # chain includes ToolErrorHandlingMiddleware (inner), which stamps deerflow_tool_meta
@@ -203,9 +207,11 @@ def _build_runtime_middlewares(
     if tool_progress_config.enabled:
         from deerflow.agents.middlewares.tool_progress_middleware import ToolProgressMiddleware as _ToolProgressMiddleware
 
-        middlewares.append(_ToolProgressMiddleware.from_config(tool_progress_config))
+        tail.append(_ToolProgressMiddleware.from_config(tool_progress_config))
 
-    middlewares.append(ToolErrorHandlingMiddleware())
+    tail.append(ToolErrorHandlingMiddleware())
+
+    middlewares = [*outer_wrappers, *thread_hooks, *tail]
 
     # Guard: ToolProgressMiddleware (outer) must appear before ToolErrorHandlingMiddleware (inner)
     # so that its wrap_tool_call chain encloses the stamping step.  Fail loudly at build time
