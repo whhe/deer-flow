@@ -298,8 +298,8 @@ def test_build_lead_runtime_middlewares_chain_order_matches_agents_md():
         ("DanglingToolCallMiddleware", DanglingToolCallMiddleware),
         ("LLMErrorHandlingMiddleware", LLMErrorHandlingMiddleware),
         ("SandboxAuditMiddleware", SandboxAuditMiddleware),
-        ("ToolErrorHandlingMiddleware", ToolErrorHandlingMiddleware),
         ("ReadBeforeWriteMiddleware", ReadBeforeWriteMiddleware),
+        ("ToolErrorHandlingMiddleware", ToolErrorHandlingMiddleware),
     ]
     actual = [(label, idx_of(cls, label=label)) for label, cls in expected_order]
 

@@ -218,6 +218,16 @@ def _build_runtime_middlewares(
 
     tail.append(SandboxAuditMiddleware())
 
+    # ReadBeforeWriteMiddleware is the outermost write gate: it blocks writes to files
+    # the model hasn't read in their current version.  It must sit outside ToolProgress
+    # and ToolErrorHandling so that a blocked write returns immediately without consuming
+    # a ToolProgress slot.  The middleware stamps deerflow_tool_meta on the blocked
+    # ToolMessage itself so downstream callers receive a well-formed result.
+    if app_config.read_before_write.enabled:
+        from deerflow.agents.middlewares.read_before_write_middleware import ReadBeforeWriteMiddleware
+
+        tail.append(ReadBeforeWriteMiddleware())
+
     # ToolProgressMiddleware must be outer (lower index) so its wrap_tool_call handler
     # chain includes ToolErrorHandlingMiddleware (inner), which stamps deerflow_tool_meta
     # on every result before ToolProgressMiddleware reads it in _update_state_from_result.
@@ -230,11 +240,6 @@ def _build_runtime_middlewares(
         tail.append(_ToolProgressMiddleware.from_config(tool_progress_config))
 
     tail.append(ToolErrorHandlingMiddleware(app_config=app_config))
-
-    if app_config.read_before_write.enabled:
-        from deerflow.agents.middlewares.read_before_write_middleware import ReadBeforeWriteMiddleware
-
-        tail.append(ReadBeforeWriteMiddleware())
 
     middlewares = [*outer_wrappers, *thread_hooks, *tail]
 
